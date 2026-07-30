@@ -1,0 +1,95 @@
+{
+  "request_id": "youtube-2026-07-30-0001",
+  "project": "SERPYN",
+  "source_type": "YOUTUBE",
+  "source_name": "Invest KZ Example",
+  "source_external_id": "UC_example_123",
+  "source_username": "@investkzexample",
+  "source_url": "https://www.youtube.com/@investkzexample",
+  "source_city": "Almaty",
+  "source_country": "KZ",
+  "item_id": "video_example_001",
+  "item_url": "https://www.youtube.com/watch?v=video_example_001",
+  "title": "Гарантированный доход каждый день",
+  "author": "Invest KZ Example",
+  "text": "Внесите 100 000 тенге и получайте гарантированный ежедневный доход. Приглашайте новых участников.",
+  "published_at": "2026-07-30T10:00:00+05:00",
+  "language": "ru",
+  "category": "PYRAMID",
+  "risk_score": 0.94,
+  "confidence": 0.91,
+  "explanation": "Обещание гарантированной доходности и выплаты за привлечение новых участников.",
+  "red_flags": [
+    "гарантированный доход",
+    "вознаграждение за приглашение участников",
+    "отсутствует описание реальной деятельности"
+  ],
+  "keywords": [
+    "қаржы пирамидасы",
+    "гарантированный доход",
+    "пассивный доход",
+    "реферальная программа"
+  ],
+  "model": "serpyn-classifier-v1",
+  "entities": [
+    {
+      "entity_type": "CHANNEL",
+      "value": "Invest KZ Example",
+      "role": "PROMOTER",
+      "confidence": 0.99
+    },
+    {
+      "entity_type": "DOMAIN",
+      "value": "example-invest.kz",
+      "role": "LANDING_DOMAIN",
+      "confidence": 0.95
+    },
+    {
+      "entity_type": "PHONE",
+      "value": "+7 700 000 00 00",
+      "role": "CONTACT",
+      "confidence": 0.9
+    },
+    {
+      "entity_type": "BANK_CARD",
+      "value": "4400 0000 0000 0000",
+      "role": "PAYMENT_DETAIL",
+      "confidence": 0.88
+    }
+  ],
+  "relations": [
+    {
+      "source_ref": "e0",
+      "target_ref": "e1",
+      "relation_type": "PROMOTES",
+      "confidence": 0.95,
+      "risk_score": 0.9
+    },
+    {
+      "source_ref": "e1",
+      "target_ref": "e2",
+      "relation_type": "USES_CONTACT",
+      "confidence": 0.9,
+      "risk_score": 0.8
+    },
+    {
+      "source_ref": "e1",
+      "target_ref": "e3",
+      "relation_type": "ACCEPTS_PAYMENT_TO",
+      "confidence": 0.88,
+      "risk_score": 0.92
+    }
+  ],
+  "evidence": [
+    {
+      "evidence_type": "SCREENSHOT",
+      "storage_url": "https://your-project.supabase.co/storage/v1/object/public/evidence/example.png",
+      "original_url": "https://www.youtube.com/watch?v=video_example_001",
+      "sha256": "replace-with-real-sha256",
+      "mime_type": "image/png",
+      "captured_at": "2026-07-30T10:05:00+05:00",
+      "captured_by": "serpyn-youtube-parser",
+      "entity_ref": "e0"
+    }
+  ]
+}
