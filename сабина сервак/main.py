@@ -848,7 +848,7 @@ async def legal_articles(category: Optional[str] = None):
 
 @app.post("/projects")
 async def create_or_update_project(item: ProjectIn, request: Request):
-    check_token(request)
+  #  check_token(request)
     enc_requisites = encrypt_value(item.payment_requisites)
 
     async with pool.acquire() as conn:
