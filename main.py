@@ -1,3 +1,4 @@
+import httpx
 import hashlib
 import json
 import logging
@@ -18,6 +19,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 load_dotenv()
 
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 # ---------- НАСТРОЙКА ЛОГИРОВАНИЯ ----------
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -498,7 +501,39 @@ async def lifespan(_: FastAPI):
     await run_migrations(pool)
     yield
     await pool.close()
-
+async def send_telegram_alert(
+    title: str,
+    category: str,
+    risk_score: float,
+    source_name: str,
+    post_url: str = None,
+    evidence_url: str = None,
+):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    message = (
+        f"🚨 *Новое подозрительное обнаружение!*\n"
+        f"📌 *Источник:* {source_name}\n"
+        f"📂 *Категория:* `{category}`\n"
+        f"📊 *Риск:* {risk_score:.2f}\n"
+        f"📝 *Тема:* {title[:200]}\n"
+    )
+    if post_url:
+        message += f"\n🔗 [Открыть пост]({post_url})"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            await client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown", "disable_web_page_preview": True},
+            )
+            if evidence_url:
+                await client.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+                    json={"chat_id": TELEGRAM_CHAT_ID, "photo": evidence_url, "caption": f"Скриншот: {title[:50]}"},
+                )
+        except Exception:
+            pass
+            
 app = FastAPI(
     title="SERPYN OSINT API",
     version="2.0.1",
@@ -593,6 +628,8 @@ async def save_ingest(ev: IngestRequest) -> dict:
                         json.dumps(relation.metadata, ensure_ascii=False),
                     )
 
+                
+
                 for evidence in ev.evidence:
                     entity_id = entity_ids.get(evidence.entity_ref) if evidence.entity_ref else None
                     await conn.execute(
@@ -630,7 +667,58 @@ async def save_ingest(ev: IngestRequest) -> dict:
                     """,
                     ev.request_id, ev.source_type, payload_hash,
                 )
+async def send_telegram_alert(
+    title: str,
+    category: str,
+    risk_score: float,
+    source_name: str,
+    post_url: str = None,
+    evidence_urls: List[str] = None,
+):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
 
+    message = (
+        f"🚨 *Новое подозрительное обнаружение!*\n"
+        f"📌 *Источник:* {source_name}\n"
+        f"📂 *Категория:* `{category}`\n"
+        f"📊 *Риск:* {risk_score:.2f}\n"
+        f"📝 *Тема:* {title[:200]}\n"
+    )
+    if post_url:
+        message += f"\n🔗 [Открыть пост]({post_url})"
+
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": "📊 Открыть дашборд", "url": "https://serpyn-serpyn.up.railway.app/"}]
+        ]
+    }
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            await client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": message,
+                    "parse_mode": "Markdown",
+                    "disable_web_page_preview": True,
+                    "reply_markup": keyboard,
+                },
+            )
+            if evidence_urls:
+                for url in evidence_urls[:10]:  # максимум 10 фото
+                    await client.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+                        json={
+                            "chat_id": TELEGRAM_CHAT_ID,
+                            "photo": url,
+                            "caption": f"📸 Скриншот: {title[:50]}",
+                        },
+                    )
+            logger.info("Telegram-уведомление отправлено")
+        except Exception as e:
+            logger.exception("Ошибка отправки в Telegram")
         return {
             "status": "success",
             "project": ev.project,
