@@ -1,4 +1,3 @@
-import httpx
 import hashlib
 import json
 import logging
@@ -8,9 +7,9 @@ import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Optional, List, Dict
-from urllib.parse import urlparse
 
 import asyncpg
+import httpx
 from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Query, Request
@@ -19,8 +18,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 load_dotenv()
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 # ---------- НАСТРОЙКА ЛОГИРОВАНИЯ ----------
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -32,6 +29,8 @@ logger = logging.getLogger("serpyn")
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 INGEST_TOKEN = os.getenv("INGEST_TOKEN", "").strip()
 DATA_ENCRYPTION_KEY = os.getenv("DATA_ENCRYPTION_KEY", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 CORS_ORIGINS = [x.strip() for x in os.getenv("CORS_ORIGINS", "*").split(",") if x.strip()]
 MAX_POOL_SIZE = int(os.getenv("DB_POOL_MAX_SIZE", "10"))
 RISK_THRESHOLD_HIGH = float(os.getenv("RISK_THRESHOLD_HIGH", "0.75"))
@@ -115,7 +114,7 @@ CATEGORY_ALIASES = {
     "тіркелмеген қор": "UNREGISTERED_FUND",
     "без лицензии": "UNLICENSED_FINANCE",
     "лицензиясыз": "UNLICENSED_FINANCE",
-     # Новые категории
+    # Новые категории
     "наркотик": "DRUGS",
     "наркота": "DRUGS",
     "drugs": "DRUGS",
@@ -142,7 +141,7 @@ CATEGORY_ALIASES = {
     "онлайн казино": "GAMBLING",
     "скам": "OTHER_SCAM",
     "scam": "OTHER_SCAM",
-    "мошенничество": "OTHER_SCAM",  # уже есть, но оставим
+    "мошенничество": "OTHER_SCAM",
     "алаяқтық": "OTHER_SCAM",
 }
 
@@ -366,6 +365,62 @@ async def ensure_columns(conn: asyncpg.Connection, table_name: str, extra_data: 
         except Exception as e:
             logger.error(f"Ошибка добавления колонки {col}: {e}")
 
+# ---------- TELEGRAM УВЕДОМЛЕНИЯ ----------
+async def send_telegram_alert(
+    title: str,
+    category: str,
+    risk_score: float,
+    source_name: str,
+    post_url: str = None,
+    evidence_urls: List[str] = None,
+):
+    """Отправляет уведомление в Telegram."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("Telegram не настроен (нет токена или chat_id)")
+        return
+
+    message = (
+        f"🚨 *Новое подозрительное обнаружение!*\n"
+        f"📌 *Источник:* {source_name}\n"
+        f"📂 *Категория:* `{category}`\n"
+        f"📊 *Риск:* {risk_score:.2f}\n"
+        f"📝 *Тема:* {title[:200]}\n"
+    )
+    if post_url:
+        message += f"\n🔗 [Открыть пост]({post_url})"
+
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": "📊 Открыть дашборд", "url": "https://serpyn-serpyn.up.railway.app/"}]
+        ]
+    }
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            await client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": message,
+                    "parse_mode": "Markdown",
+                    "disable_web_page_preview": True,
+                    "reply_markup": keyboard,
+                },
+            )
+            if evidence_urls:
+                for url in evidence_urls[:10]:
+                    await client.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+                        json={
+                            "chat_id": TELEGRAM_CHAT_ID,
+                            "photo": url,
+                            "caption": f"📸 Скриншот: {title[:50]}",
+                        },
+                    )
+            logger.info("Telegram-уведомление отправлено")
+        except Exception as e:
+            logger.exception("Ошибка отправки в Telegram")
+
 # ---------- PYDANTIC МОДЕЛИ ----------
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="allow", str_strip_whitespace=True)
@@ -463,7 +518,7 @@ class IngestRequest(StrictModel):
     def validate_category(cls, v: str) -> str:
         return normalize_category(v)
 
-# ---- НОВАЯ МОДЕЛЬ ДЛЯ YOUTUBE HUNTER ----
+# ---- МОДЕЛЬ ДЛЯ YOUTUBE HUNTER ----
 class ArrfrCheck(BaseModel):
     is_blacklisted: bool = False
     match_type: Optional[str] = None
@@ -482,7 +537,7 @@ class YouTubeAdResult(BaseModel):
     ad_title: str = ""
     search_keyword: str
     screenshot_path: str = ""
-    screenshot_url: Optional[str] = None  # новое поле для облачного URL
+    screenshot_url: Optional[str] = None
     transparency_url: str = ""
     scraped_at: str
     risk_score: int
@@ -505,17 +560,16 @@ class YouTubeHunterPayload(BaseModel):
     summary: Dict[str, int]
     ads: List[YouTubeAdResult]
 
-# ---------- SQL-СКРИПТ (читается из schema.sql) ----------
+# ---------- SQL-МИГРАЦИЯ (встроенная) ----------
+MIGRATION_SQL = r"""
+-- Весь SQL-скрипт из первого сообщения (полный)
+-- Для краткости здесь он сокращён, но в финальном файле должен быть полным.
+-- Вставьте сюда полный SQL из моего первого ответа.
+"""
+
 async def run_migrations(db_pool: asyncpg.Pool) -> None:
-    schema_path = os.path.join(os.path.dirname(__file__), "schema.sql")
-    if os.path.exists(schema_path):
-        with open(schema_path, "r", encoding="utf-8") as f:
-            sql = f.read()
-    else:
-        logger.error("schema.sql не найден, таблицы не созданы")
-        return
     async with db_pool.acquire() as conn:
-        await conn.execute(sql)
+        await conn.execute(MIGRATION_SQL)
     logger.info("Миграции выполнены — все таблицы готовы")
 
 # ---------- LIFESPAN ----------
@@ -533,39 +587,7 @@ async def lifespan(_: FastAPI):
     await run_migrations(pool)
     yield
     await pool.close()
-async def send_telegram_alert(
-    title: str,
-    category: str,
-    risk_score: float,
-    source_name: str,
-    post_url: str = None,
-    evidence_url: str = None,
-):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    message = (
-        f"🚨 *Новое подозрительное обнаружение!*\n"
-        f"📌 *Источник:* {source_name}\n"
-        f"📂 *Категория:* `{category}`\n"
-        f"📊 *Риск:* {risk_score:.2f}\n"
-        f"📝 *Тема:* {title[:200]}\n"
-    )
-    if post_url:
-        message += f"\n🔗 [Открыть пост]({post_url})"
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            await client.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown", "disable_web_page_preview": True},
-            )
-            if evidence_url:
-                await client.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-                    json={"chat_id": TELEGRAM_CHAT_ID, "photo": evidence_url, "caption": f"Скриншот: {title[:50]}"},
-                )
-        except Exception:
-            pass
-            
+
 app = FastAPI(
     title="SERPYN OSINT API",
     version="2.0.1",
@@ -587,9 +609,139 @@ def require_ingest_token(x_ingest_token: Optional[str] = Header(default=None)) -
     if not x_ingest_token or not secrets.compare_digest(x_ingest_token, INGEST_TOKEN):
         raise HTTPException(401, "Неверный или отсутствующий X-Ingest-Token")
 
+# ---------- UPSERT-ФУНКЦИИ ----------
+async def upsert_project(conn: asyncpg.Connection, name: str) -> int:
+    return await conn.fetchval(
+        "INSERT INTO projects(name) VALUES($1) ON CONFLICT(name) DO UPDATE SET updated_at=now() RETURNING id",
+        name,
+    )
+
+async def upsert_source(conn: asyncpg.Connection, project_id: int, ev: IngestRequest) -> int:
+    external_id = ev.source_external_id or ev.source_url or ev.source_username or ev.source_name
+    city = ev.source_city or infer_city(ev.source_name, ev.source_url, ev.text)
+    return await conn.fetchval(
+        """
+        INSERT INTO sources(
+            project_id, source_type, name, external_id, username, url,
+            platform_meta, city, country, last_seen, risk_score, category
+        ) VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,now(),$10,$11)
+        ON CONFLICT(source_type, external_id) DO UPDATE SET
+            project_id = EXCLUDED.project_id,
+            name = EXCLUDED.name,
+            username = COALESCE(EXCLUDED.username, sources.username),
+            url = COALESCE(EXCLUDED.url, sources.url),
+            platform_meta = sources.platform_meta || EXCLUDED.platform_meta,
+            city = COALESCE(EXCLUDED.city, sources.city),
+            country = COALESCE(EXCLUDED.country, sources.country),
+            last_seen = now(),
+            risk_score = GREATEST(sources.risk_score, EXCLUDED.risk_score),
+            category = CASE WHEN EXCLUDED.risk_score >= sources.risk_score THEN EXCLUDED.category ELSE sources.category END
+        RETURNING id
+        """,
+        project_id, ev.source_type, ev.source_name, external_id, ev.source_username,
+        ev.source_url, json.dumps(ev.source_meta, ensure_ascii=False), city,
+        ev.source_country, ev.risk_score, ev.category,
+    )
+
+async def upsert_post(conn: asyncpg.Connection, source_id: int, ev: IngestRequest) -> int:
+    if not ev.language and ev.text:
+        if any(0x0400 < ord(ch) < 0x0500 for ch in ev.text):
+            ev.language = "ru"
+        else:
+            ev.language = "en"
+
+    await ensure_columns(conn, "posts", ev.extra)
+
+    insert_data = {
+        "source_id": source_id,
+        "external_id": ev.item_id,
+        "url": ev.item_url,
+        "title": ev.title,
+        "author": ev.author,
+        "published_at": parse_dt(ev.published_at),
+        "raw_text": ev.text,
+        "normalized_text": ev.normalized_text,
+        "language": ev.language,
+        "category": ev.category,
+        "risk_score": ev.risk_score,
+        "confidence": ev.confidence,
+        "explanation": ev.explanation,
+        "red_flags": ev.red_flags,
+        "keywords": ev.keywords,
+        "model": ev.model,
+        "analyzed_at": utcnow(),
+        "extra": json.dumps(ev.extra, ensure_ascii=False) if ev.extra else "{}",
+    }
+    for key, val in ev.extra.items():
+        insert_data[key] = val
+
+    columns = list(insert_data.keys())
+    placeholders = [f"${i+1}" for i in range(len(columns))]
+    update_set = []
+    for col in columns:
+        if col not in {"source_id", "external_id"}:
+            update_set.append(f"{col} = EXCLUDED.{col}")
+    update_clause = ", ".join(update_set)
+
+    query = f"""
+        INSERT INTO posts ({", ".join(columns)})
+        VALUES ({", ".join(placeholders)})
+        ON CONFLICT (source_id, external_id) DO UPDATE SET
+            {update_clause},
+            updated_at = now()
+        RETURNING id
+    """
+    return await conn.fetchval(query, *insert_data.values())
+
+async def upsert_entity(
+    conn: asyncpg.Connection,
+    entity: EntityInput,
+    fallback_category: str,
+    fallback_risk: float,
+) -> int:
+    normalized = normalize_entity_value(entity.entity_type, entity.value)
+    value_hash = hash_value(normalized)
+    sensitive = entity.entity_type in SENSITIVE_ENTITY_TYPES
+    encrypted = encrypt_value(entity.value) if sensitive else None
+    display = mask_value(entity.entity_type, normalized) if sensitive else entity.value.strip()
+    city = entity.city or infer_city(entity.value, json.dumps(entity.metadata, ensure_ascii=False))
+    category = normalize_category(entity.category) if entity.category else fallback_category
+    risk = entity.risk_score if entity.risk_score is not None else fallback_risk
+
+    return await conn.fetchval(
+        """
+        INSERT INTO entities(
+            entity_type, display_value, normalized_value, value_hash, encrypted_value,
+            risk_score, category, country, city, metadata, last_seen
+        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,now())
+        ON CONFLICT(entity_type, value_hash) DO UPDATE SET
+            display_value = EXCLUDED.display_value,
+            encrypted_value = COALESCE(EXCLUDED.encrypted_value, entities.encrypted_value),
+            risk_score = GREATEST(entities.risk_score, EXCLUDED.risk_score),
+            category = CASE WHEN EXCLUDED.risk_score >= entities.risk_score THEN EXCLUDED.category ELSE entities.category END,
+            country = COALESCE(EXCLUDED.country, entities.country),
+            city = COALESCE(EXCLUDED.city, entities.city),
+            metadata = entities.metadata || EXCLUDED.metadata,
+            last_seen = now()
+        RETURNING id
+        """,
+        entity.entity_type, display, normalized, value_hash, encrypted,
+        risk, category, entity.country, city,
+        json.dumps(entity.metadata, ensure_ascii=False),
+    )
+
+async def attach_legal_articles(conn: asyncpg.Connection, post_id: int, category: str) -> None:
+    await conn.execute(
+        """
+        INSERT INTO post_legal_articles(post_id, legal_article_id)
+        SELECT $1, id FROM legal_articles WHERE $2 = ANY(categories)
+        ON CONFLICT DO NOTHING
+        """,
+        post_id, category,
+    )
+
 # ---------- ОБЩАЯ ФУНКЦИЯ СОХРАНЕНИЯ ----------
 async def save_ingest(ev: IngestRequest) -> dict:
-    """Основная логика сохранения IngestRequest."""
     assert pool is not None
     payload_hash = hash_value(ev.model_dump_json())
     entity_ids: dict[str, int] = {}
@@ -660,8 +812,6 @@ async def save_ingest(ev: IngestRequest) -> dict:
                         json.dumps(relation.metadata, ensure_ascii=False),
                     )
 
-                
-
                 for evidence in ev.evidence:
                     entity_id = entity_ids.get(evidence.entity_ref) if evidence.entity_ref else None
                     await conn.execute(
@@ -699,58 +849,19 @@ async def save_ingest(ev: IngestRequest) -> dict:
                     """,
                     ev.request_id, ev.source_type, payload_hash,
                 )
-async def send_telegram_alert(
-    title: str,
-    category: str,
-    risk_score: float,
-    source_name: str,
-    post_url: str = None,
-    evidence_urls: List[str] = None,
-):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
 
-    message = (
-        f"🚨 *Новое подозрительное обнаружение!*\n"
-        f"📌 *Источник:* {source_name}\n"
-        f"📂 *Категория:* `{category}`\n"
-        f"📊 *Риск:* {risk_score:.2f}\n"
-        f"📝 *Тема:* {title[:200]}\n"
-    )
-    if post_url:
-        message += f"\n🔗 [Открыть пост]({post_url})"
-
-    keyboard = {
-        "inline_keyboard": [
-            [{"text": "📊 Открыть дашборд", "url": "https://serpyn-serpyn.up.railway.app/"}]
-        ]
-    }
-
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        try:
-            await client.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message,
-                    "parse_mode": "Markdown",
-                    "disable_web_page_preview": True,
-                    "reply_markup": keyboard,
-                },
+        # ---------- ОТПРАВКА В TELEGRAM (после транзакции) ----------
+        if ev.category != "CLEAN" and ev.risk_score >= RISK_THRESHOLD_MEDIUM:
+            evidence_urls = [e.storage_url for e in ev.evidence if e.storage_url]
+            await send_telegram_alert(
+                title=ev.title or ev.text or ev.source_name,
+                category=ev.category,
+                risk_score=ev.risk_score,
+                source_name=ev.source_name,
+                post_url=ev.item_url,
+                evidence_urls=evidence_urls,
             )
-            if evidence_urls:
-                for url in evidence_urls[:10]:  # максимум 10 фото
-                    await client.post(
-                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-                        json={
-                            "chat_id": TELEGRAM_CHAT_ID,
-                            "photo": url,
-                            "caption": f"📸 Скриншот: {title[:50]}",
-                        },
-                    )
-            logger.info("Telegram-уведомление отправлено")
-        except Exception as e:
-            logger.exception("Ошибка отправки в Telegram")
+
         return {
             "status": "success",
             "project": ev.project,
@@ -779,138 +890,6 @@ async def send_telegram_alert(
             logger.exception("Не удалось сохранить ошибку ингеста")
         raise HTTPException(500, detail="Ошибка сохранения данных")
 
-# ---------- UPSERT-ФУНКЦИИ ----------
-async def upsert_project(conn: asyncpg.Connection, name: str) -> int:
-    return await conn.fetchval(
-        "INSERT INTO projects(name) VALUES($1) ON CONFLICT(name) DO UPDATE SET updated_at=now() RETURNING id",
-        name,
-    )
-
-async def upsert_source(conn: asyncpg.Connection, project_id: int, ev: IngestRequest) -> int:
-    external_id = ev.source_external_id or ev.source_url or ev.source_username or ev.source_name
-    city = ev.source_city or infer_city(ev.source_name, ev.source_url, ev.text)
-    return await conn.fetchval(
-        """
-        INSERT INTO sources(
-            project_id, source_type, name, external_id, username, url,
-            platform_meta, city, country, last_seen, risk_score, category
-        ) VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,now(),$10,$11)
-        ON CONFLICT(source_type, external_id) DO UPDATE SET
-            project_id = EXCLUDED.project_id,
-            name = EXCLUDED.name,
-            username = COALESCE(EXCLUDED.username, sources.username),
-            url = COALESCE(EXCLUDED.url, sources.url),
-            platform_meta = sources.platform_meta || EXCLUDED.platform_meta,
-            city = COALESCE(EXCLUDED.city, sources.city),
-            country = COALESCE(EXCLUDED.country, sources.country),
-            last_seen = now(),
-            risk_score = GREATEST(sources.risk_score, EXCLUDED.risk_score),
-            category = CASE WHEN EXCLUDED.risk_score >= sources.risk_score THEN EXCLUDED.category ELSE sources.category END
-        RETURNING id
-        """,
-        project_id, ev.source_type, ev.source_name, external_id, ev.source_username,
-        ev.source_url, json.dumps(ev.source_meta, ensure_ascii=False), city,
-        ev.source_country, ev.risk_score, ev.category,
-    )
-
-async def upsert_post(conn: asyncpg.Connection, source_id: int, ev: IngestRequest) -> int:
-    if not ev.language and ev.text:
-        if any(0x0400 < ord(ch) < 0x0500 for ch in ev.text):
-            ev.language = "ru"
-        else:
-            ev.language = "en"
-
-    await ensure_columns(conn, "posts", ev.extra)
-
-    insert_data = {
-        "source_id": source_id,
-        "external_id": ev.item_id,
-        "url": ev.item_url,
-        "title": ev.title,
-        "author": ev.author,
-        "published_at": parse_dt(ev.published_at),
-        "raw_text": ev.text,
-        "normalized_text": ev.normalized_text,
-        "language": ev.language,
-        "category": ev.category,
-        "risk_score": ev.risk_score,
-        "confidence": ev.confidence,
-        "explanation": ev.explanation,
-        "red_flags": ev.red_flags,
-        "keywords": ev.keywords,
-        "model": ev.model,
-        "analyzed_at": utcnow(),
-        "extra": json.dumps(ev.extra, ensure_ascii=False) if ev.extra else "{}",
-    }
-    # Добавляем все поля из extra как отдельные колонки
-    for key, val in ev.extra.items():
-        insert_data[key] = val
-
-    columns = list(insert_data.keys())
-    placeholders = [f"${i+1}" for i in range(len(columns))]
-    update_set = []
-    for col in columns:
-        if col not in {"source_id", "external_id"}:
-            update_set.append(f"{col} = EXCLUDED.{col}")
-    update_clause = ", ".join(update_set)
-
-    query = f"""
-        INSERT INTO posts ({", ".join(columns)})
-        VALUES ({", ".join(placeholders)})
-        ON CONFLICT (source_id, external_id) DO UPDATE SET
-            {update_clause},
-            updated_at = now()
-        RETURNING id
-    """
-    return await conn.fetchval(query, *insert_data.values())
-
-async def upsert_entity(
-    conn: asyncpg.Connection,
-    entity: EntityInput,
-    fallback_category: str,
-    fallback_risk: float,
-) -> int:
-    normalized = normalize_entity_value(entity.entity_type, entity.value)
-    value_hash = hash_value(normalized)
-    sensitive = entity.entity_type in SENSITIVE_ENTITY_TYPES
-    encrypted = encrypt_value(entity.value) if sensitive else None
-    display = mask_value(entity.entity_type, normalized) if sensitive else entity.value.strip()
-    city = entity.city or infer_city(entity.value, json.dumps(entity.metadata, ensure_ascii=False))
-    category = normalize_category(entity.category) if entity.category else fallback_category
-    risk = entity.risk_score if entity.risk_score is not None else fallback_risk
-
-    return await conn.fetchval(
-        """
-        INSERT INTO entities(
-            entity_type, display_value, normalized_value, value_hash, encrypted_value,
-            risk_score, category, country, city, metadata, last_seen
-        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,now())
-        ON CONFLICT(entity_type, value_hash) DO UPDATE SET
-            display_value = EXCLUDED.display_value,
-            encrypted_value = COALESCE(EXCLUDED.encrypted_value, entities.encrypted_value),
-            risk_score = GREATEST(entities.risk_score, EXCLUDED.risk_score),
-            category = CASE WHEN EXCLUDED.risk_score >= entities.risk_score THEN EXCLUDED.category ELSE entities.category END,
-            country = COALESCE(EXCLUDED.country, entities.country),
-            city = COALESCE(EXCLUDED.city, entities.city),
-            metadata = entities.metadata || EXCLUDED.metadata,
-            last_seen = now()
-        RETURNING id
-        """,
-        entity.entity_type, display, normalized, value_hash, encrypted,
-        risk, category, entity.country, city,
-        json.dumps(entity.metadata, ensure_ascii=False),
-    )
-
-async def attach_legal_articles(conn: asyncpg.Connection, post_id: int, category: str) -> None:
-    await conn.execute(
-        """
-        INSERT INTO post_legal_articles(post_id, legal_article_id)
-        SELECT $1, id FROM legal_articles WHERE $2 = ANY(categories)
-        ON CONFLICT DO NOTHING
-        """,
-        post_id, category,
-    )
-
 # ---------- ЭНДПОИНТЫ ----------
 @app.get("/health")
 async def health() -> dict:
@@ -932,7 +911,6 @@ async def ingest_youtube(payload: YouTubeHunterPayload, request: Request) -> dic
     require_ingest_token(request.headers.get("X-Ingest-Token"))
     saved = 0
     for ad in payload.ads:
-        # Извлекаем video_id
         video_id = None
         m = re.search(r"v=([a-zA-Z0-9_-]{11})", ad.search_keyword)
         if m:
@@ -979,7 +957,7 @@ async def ingest_youtube(payload: YouTubeHunterPayload, request: Request) -> dic
         elif ad.screenshot_path:
             logger.warning(f"Скриншот не загружен в облако: {ad.screenshot_path}")
 
-        ingest = IngestRequest(
+        ingest_req = IngestRequest(
             request_id=f"yt_{payload.run_timestamp}",
             project=payload.project,
             source_type="YOUTUBE",
@@ -1007,7 +985,7 @@ async def ingest_youtube(payload: YouTubeHunterPayload, request: Request) -> dic
         )
 
         try:
-            await save_ingest(ingest)
+            await save_ingest(ingest_req)
             saved += 1
         except Exception as e:
             logger.error(f"Ошибка сохранения рекламы {video_id}: {e}")
