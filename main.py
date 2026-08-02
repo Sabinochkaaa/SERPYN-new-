@@ -917,6 +917,28 @@ async def ingest(ev: IngestRequest, request: Request) -> dict:
 async def ingest_youtube(payload: YouTubeHunterPayload, request: Request) -> dict:
     require_ingest_token(request.headers.get("X-Ingest-Token"))
     saved = 0
+    
+    # Функция определения типа источника по URL
+    def detect_source_type(url: str) -> str:
+        if not url:
+            return "OTHER"
+        url_lower = url.lower()
+        if "youtube.com" in url_lower or "youtu.be" in url_lower:
+            return "YOUTUBE"
+        if "t.me" in url_lower or "telegram" in url_lower:
+            return "TELEGRAM"
+        if "instagram.com" in url_lower:
+            return "INSTAGRAM"
+        if "tiktok.com" in url_lower:
+            return "TIKTOK"
+        if "threads.net" in url_lower:
+            return "THREADS"
+        if "facebook.com" in url_lower or "fb.com" in url_lower:
+            return "FACEBOOK"
+        if "vk.com" in url_lower:
+            return "VK"
+        return "OTHER"
+    
     for ad in payload.ads:
         video_id = None
         m = re.search(r"v=([a-zA-Z0-9_-]{11})", ad.search_keyword)
@@ -964,12 +986,27 @@ async def ingest_youtube(payload: YouTubeHunterPayload, request: Request) -> dic
         elif ad.screenshot_path:
             logger.warning(f"Скриншот не загружен в облако: {ad.screenshot_path}")
 
+        # Определяем реальный тип источника по URL
+        real_source_type = detect_source_type(ad.transparency_url or ad.search_keyword)
+        
+        # Для Telegram извлекаем username из ссылки
+        source_external_id = ad.advertiser_domain or video_id
+        if real_source_type == "TELEGRAM" and ad.transparency_url:
+            tg_match = re.search(r"t\.me/([a-zA-Z0-9_]+|\+[a-zA-Z0-9_]+)", ad.transparency_url)
+            if tg_match:
+                source_external_id = tg_match.group(1)
+        
+        # Для Telegram используем имя из advertiser_name
+        source_name = ad.advertiser_name or "YouTube Ad"
+        if real_source_type == "TELEGRAM" and ad.advertiser_name:
+            source_name = ad.advertiser_name
+
         ingest_req = IngestRequest(
             request_id=f"yt_{payload.run_timestamp}",
             project=payload.project,
-            source_type="YOUTUBE",
-            source_name=ad.advertiser_name or "YouTube Ad",
-            source_external_id=ad.advertiser_domain or video_id,
+            source_type=real_source_type,  # ← ТЕПЕРЬ ДИНАМИЧЕСКИЙ!
+            source_name=source_name,
+            source_external_id=source_external_id,
             source_url=ad.transparency_url,
             source_country="KZ",
             item_id=video_id,
