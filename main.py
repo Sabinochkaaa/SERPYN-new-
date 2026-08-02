@@ -61,6 +61,9 @@ ALLOWED_CATEGORIES = {
     "FAKE_INVESTMENT", "UNREGISTERED_FUND", "INVESTMENT_SCAM", "CRYPTO_SCAM",
     "FAKE_BROKER", "FAKE_EXCHANGE", "ILLEGAL_INVESTMENT", "UNLICENSED_FINANCE",
     "SUSPICIOUS_JOB", "FINANCIAL_FRAUD", "CLEAN", "UNKNOWN",
+    "DRUGS", "WEAPONS", "FORGERY", "COUNTERFEIT", "ILLEGAL_SERVICES",
+    "EXTORTION", "PHISHING", "FAKE_SHOP", "FAKE_JOB", "ROMANCE_SCAM",
+    "GAMBLING", "OTHER_SCAM",
 }
 
 CATEGORY_ALIASES = {
@@ -112,6 +115,35 @@ CATEGORY_ALIASES = {
     "тіркелмеген қор": "UNREGISTERED_FUND",
     "без лицензии": "UNLICENSED_FINANCE",
     "лицензиясыз": "UNLICENSED_FINANCE",
+     # Новые категории
+    "наркотик": "DRUGS",
+    "наркота": "DRUGS",
+    "drugs": "DRUGS",
+    "оружие": "WEAPONS",
+    "weapon": "WEAPONS",
+    "подделка документов": "FORGERY",
+    "фальшивые документы": "FORGERY",
+    "контрафакт": "COUNTERFEIT",
+    "подделка": "COUNTERFEIT",
+    "незаконные услуги": "ILLEGAL_SERVICES",
+    "теневые услуги": "ILLEGAL_SERVICES",
+    "вымогательство": "EXTORTION",
+    "рэкет": "EXTORTION",
+    "фишинг": "PHISHING",
+    "phishing": "PHISHING",
+    "фейк магазин": "FAKE_SHOP",
+    "поддельный магазин": "FAKE_SHOP",
+    "фейк работа": "FAKE_JOB",
+    "ложная вакансия": "FAKE_JOB",
+    "романтик скам": "ROMANCE_SCAM",
+    "love scam": "ROMANCE_SCAM",
+    "азартные игры": "GAMBLING",
+    "казино": "GAMBLING",
+    "онлайн казино": "GAMBLING",
+    "скам": "OTHER_SCAM",
+    "scam": "OTHER_SCAM",
+    "мошенничество": "OTHER_SCAM",  # уже есть, но оставим
+    "алаяқтық": "OTHER_SCAM",
 }
 
 ENTITY_TYPES = {
