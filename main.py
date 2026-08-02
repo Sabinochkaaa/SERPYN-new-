@@ -568,8 +568,15 @@ MIGRATION_SQL = r"""
 """
 
 async def run_migrations(db_pool: asyncpg.Pool) -> None:
+    schema_path = os.path.join(os.path.dirname(__file__), "schema.sql")
+    if os.path.exists(schema_path):
+        with open(schema_path, "r", encoding="utf-8") as f:
+            sql = f.read()
+    else:
+        logger.error("schema.sql не найден, таблицы не созданы")
+        return
     async with db_pool.acquire() as conn:
-        await conn.execute(MIGRATION_SQL)
+        await conn.execute(sql)
     logger.info("Миграции выполнены — все таблицы готовы")
 
 # ---------- LIFESPAN ----------
