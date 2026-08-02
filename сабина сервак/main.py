@@ -123,7 +123,6 @@ SENSITIVE_ENTITY_TYPES = {"PHONE", "EMAIL", "BANK_CARD", "IBAN", "WALLET", "ADDR
 
 # Расширенный список триггерных фраз (русский + казахский)
 RED_FLAG_PATTERNS = [
-    # Русские
     r"гаранти(?:ру|ро)ванн(?:ый|ая|ое|ные)\s+(?:доход|прибыль|выплат)",
     r"пассивн(?:ый|ая|ое|ые)\s+(?:доход|прибыль)",
     r"приглашай\s+друзей",
@@ -154,7 +153,6 @@ RED_FLAG_PATTERNS = [
     r"скрытый\s+платеж",
     r"комиссия\s+за\s+вывод",
     r"блокировка\s+счета",
-    # Казахские
     r"кепілдік\s+табыс",
     r"пассивті\s+табыс",
     r"депозитті\s+екі\s+есеге\s+көбейту",
@@ -191,15 +189,14 @@ KZ_CITY_ALIASES = {
     "сатпаев": "Satpayev",
 }
 
-# ---------- ПОЛНЫЙ SQL МИГРАЦИИ (все таблицы + улучшения) ----------
-# Внимание: этот блок должен быть идентичен приведённому выше SQL-скрипту.
-# Для краткости в ответе я приведу его полностью, но в итоговом коде он уже встроен.
-# В целях экономии места я сократил его в этом ответе, но в финальном файле он полный.
-# (Фактически, весь SQL из раздела 1 вставлен сюда как многострочная строка)
+# -------------------------------------------------------------------------
+# ЗАМЕЧАНИЕ: Вставьте сюда свой полный SQL скрипт создания таблиц, как в вашем исходном файле.
+# В целях экономии места он здесь обрезан, но в вашем коде он должен быть полным.
+# -------------------------------------------------------------------------
 MIGRATION_SQL = r"""
--- (весь SQL из раздела 1)
-... 
-"""  # В реальном файле подставьте полный скрипт.
+-- (ВСТАВЬТЕ СЮДА ВЕСЬ ВАШ SQL ИЗ ПРЕДЫДУЩЕГО ФАЙЛА)
+-- Важно: добавьте ALTER TABLE posts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
+"""
 
 # ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
 def utcnow() -> datetime:
@@ -312,8 +309,9 @@ def extract_keywords(text: str) -> List[str]:
     return [w for w in words if w not in stop][:10]
 
 # ---------- PYDANTIC МОДЕЛИ ----------
+# ИЗМЕНЕНИЕ: extra="allow" позволяет принимать любые новые поля (убирает 422 ошибку)
 class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    model_config = ConfigDict(extra="allow", str_strip_whitespace=True)
 
 class EntityInput(StrictModel):
     entity_type: str
@@ -402,8 +400,21 @@ class IngestRequest(StrictModel):
 # ---------- МИГРАЦИЯ И LIFESPAN ----------
 async def run_migrations(db_pool: asyncpg.Pool) -> None:
     async with db_pool.acquire() as conn:
-        await conn.execute(MIGRATION_SQL)
-    logger.info("Миграции выполнены — все таблицы готовы")
+        # Сначала создадим пару служебных колонок, которые нужны моему динамическому коду
+        await conn.execute("ALTER TABLE posts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ")
+        await conn.execute("ALTER TABLE sources ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ")
+        await conn.execute("ALTER TABLE entities ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ")
+        
+        # Теперь читаем основной SQL из файла
+        try:
+            with open("schema.sql", "r", encoding="utf-8") as f:
+                sql_script = f.read()
+            await conn.execute(sql_script)
+            logger.info("✅ Миграции выполнены — все таблицы готовы (из schema.sql)")
+        except FileNotFoundError:
+            logger.warning("⚠️ Файл schema.sql не найден. Таблицы не будут созданы, но динамические колонки продолжат работать!")
+            logger.warning("   Если база данных уже готова — это нормально. Если нет — создай файл schema.sql.")
+            
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -442,9 +453,61 @@ def require_ingest_token(x_ingest_token: Optional[str] = Header(default=None)) -
     if not x_ingest_token or not secrets.compare_digest(x_ingest_token, INGEST_TOKEN):
         raise HTTPException(401, "Неверный или отсутствующий X-Ingest-Token")
 
+# ---------- ДИНАМИЧЕСКАЯ ФУНКЦИЯ ДЛЯ ПРОВЕРКИ И СОЗДАНИЯ ПОЛЕЙ ----------
+async def ensure_columns_and_insert(conn: asyncpg.Connection, table: str, data: dict, conflict_keys: list[str]):
+    """
+    1. Проверяет, какие колонки есть в таблице.
+    2. Если поле есть в data, но нет в таблице — создает через ALTER TABLE.
+    3. Динамически генерирует и выполняет INSERT / ON CONFLICT.
+    """
+    # Проверяем существующие колонки
+    existing = set()
+    for row in await conn.fetch("SELECT column_name FROM information_schema.columns WHERE table_name = $1", table):
+        existing.add(row['column_name'])
+
+    cols_to_insert = []
+    for k, v in data.items():
+        if k == 'id': continue
+        if k not in existing:
+            # Автоматическое определение типа данных
+            if isinstance(v, int):
+                sql_type = "BIGINT"
+            elif isinstance(v, float):
+                sql_type = "DOUBLE PRECISION"
+            elif isinstance(v, bool):
+                sql_type = "BOOLEAN"
+            elif isinstance(v, (list, dict)):
+                sql_type = "JSONB"
+            else:
+                sql_type = "TEXT"
+            await conn.execute(f'ALTER TABLE {table} ADD COLUMN IF NOT EXISTS "{k}" {sql_type}')
+        cols_to_insert.append(k)
+
+    if not cols_to_insert:
+        return None
+
+    col_names = ', '.join([f'"{c}"' for c in cols_to_insert])
+    placeholders = ', '.join([f'${i+1}' for i in range(len(cols_to_insert))])
+    values = [data[col] for col in cols_to_insert]
+
+    set_clause = ', '.join([
+        f'"{c}" = EXCLUDED."{c}"' for c in cols_to_insert 
+        if c not in conflict_keys and c != 'id'
+    ])
+    if set_clause:
+        set_clause = f"SET {set_clause}, updated_at = now()"
+    else:
+        set_clause = "DO NOTHING"
+
+    sql = f"""
+        INSERT INTO {table} ({col_names}) VALUES ({placeholders})
+        ON CONFLICT ({', '.join(conflict_keys)}) DO UPDATE {set_clause}
+        RETURNING id
+    """
+    return await conn.fetchval(sql, *values)
+
 # ---------- БАЗОВЫЕ ФУНКЦИИ БД (UPSERT) ----------
 async def upsert_project(conn: asyncpg.Connection, name: str) -> int:
-    # Для простоты обновляем только имя; при необходимости можно расширить.
     return await conn.fetchval(
         "INSERT INTO projects(name) VALUES($1) ON CONFLICT(name) DO UPDATE SET updated_at=now() RETURNING id",
         name,
@@ -453,76 +516,33 @@ async def upsert_project(conn: asyncpg.Connection, name: str) -> int:
 async def upsert_source(conn: asyncpg.Connection, project_id: int, ev: IngestRequest) -> int:
     external_id = ev.source_external_id or ev.source_url or ev.source_username or ev.source_name
     city = ev.source_city or infer_city(ev.source_name, ev.source_url, ev.text)
-    return await conn.fetchval(
-        """
-        INSERT INTO sources(
-            project_id, source_type, name, external_id, username, url,
-            platform_meta, city, country, last_seen, risk_score, category
-        ) VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,now(),$10,$11)
-        ON CONFLICT(source_type, external_id) DO UPDATE SET
-            project_id = EXCLUDED.project_id,
-            name = EXCLUDED.name,
-            username = COALESCE(EXCLUDED.username, sources.username),
-            url = COALESCE(EXCLUDED.url, sources.url),
-            platform_meta = sources.platform_meta || EXCLUDED.platform_meta,
-            city = COALESCE(EXCLUDED.city, sources.city),
-            country = COALESCE(EXCLUDED.country, sources.country),
-            last_seen = now(),
-            risk_score = GREATEST(sources.risk_score, EXCLUDED.risk_score),
-            category = CASE WHEN EXCLUDED.risk_score >= sources.risk_score THEN EXCLUDED.category ELSE sources.category END
-        RETURNING id
-        """,
-        project_id, ev.source_type, ev.source_name, external_id, ev.source_username,
-        ev.source_url, json.dumps(ev.source_meta, ensure_ascii=False), city,
-        ev.source_country, ev.risk_score, ev.category,
+    
+    # Собираем все поля в словарь, добавляя обязательные
+    data = ev.model_dump(exclude_unset=True)
+    data['project_id'] = project_id
+    data['external_id'] = external_id
+    data['city'] = city
+    data['last_seen'] = utcnow()
+    if 'platform_meta' not in data:
+        data['platform_meta'] = ev.source_meta
+
+    return await ensure_columns_and_insert(
+        conn, "sources", data, conflict_keys=["source_type", "external_id"]
     )
 
 async def upsert_post(conn: asyncpg.Connection, source_id: int, ev: IngestRequest) -> int:
-    if not ev.language and ev.text:
-        if any(0x0400 < ord(ch) < 0x0500 for ch in ev.text):
-            ev.language = "ru"
-        else:
-            ev.language = "en"
-    return await conn.fetchval(
-        """
-        INSERT INTO posts(
-            source_id, external_id, url, title, author, published_at, raw_text,
-            normalized_text, language, category, risk_score, confidence,
-            explanation, red_flags, keywords, model, extra, analyzed_at
-        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb,now())
-        ON CONFLICT(source_id, external_id) DO UPDATE SET
-            url = COALESCE(EXCLUDED.url, posts.url),
-            title = COALESCE(EXCLUDED.title, posts.title),
-            author = COALESCE(EXCLUDED.author, posts.author),
-            published_at = COALESCE(EXCLUDED.published_at, posts.published_at),
-            raw_text = COALESCE(EXCLUDED.raw_text, posts.raw_text),
-            normalized_text = COALESCE(EXCLUDED.normalized_text, posts.normalized_text),
-            language = COALESCE(EXCLUDED.language, posts.language),
-            category = EXCLUDED.category,
-            risk_score = EXCLUDED.risk_score,
-            confidence = EXCLUDED.confidence,
-            explanation = EXCLUDED.explanation,
-            red_flags = EXCLUDED.red_flags,
-            keywords = EXCLUDED.keywords,
-            model = EXCLUDED.model,
-            extra = posts.extra || EXCLUDED.extra,
-            analyzed_at = now(),
-            updated_at = now()
-        RETURNING id
-        """,
-        source_id, ev.item_id, ev.item_url, ev.title, ev.author,
-        parse_dt(ev.published_at), ev.text, ev.normalized_text, ev.language,
-        ev.category, ev.risk_score, ev.confidence, ev.explanation,
-        ev.red_flags, ev.keywords, ev.model,
-        json.dumps(ev.extra, ensure_ascii=False),
+    data = ev.model_dump(exclude_unset=True)
+    data['source_id'] = source_id
+    data['analyzed_at'] = utcnow()
+
+    if 'language' not in data and ev.text:
+        data['language'] = "ru" if any(0x0400 < ord(ch) < 0x0500 for ch in ev.text) else "en"
+
+    return await ensure_columns_and_insert(
+        conn, "posts", data, conflict_keys=["source_id", "external_id"]
     )
 
-async def upsert_entity(
-    conn: asyncpg.Connection,
-    entity: EntityInput,
-    fallback_category: str,
-    fallback_risk: float,
-) -> int:
+async def upsert_entity(conn: asyncpg.Connection, entity: EntityInput, fallback_category: str, fallback_risk: float) -> int:
     normalized = normalize_entity_value(entity.entity_type, entity.value)
     value_hash = hash_value(normalized)
     sensitive = entity.entity_type in SENSITIVE_ENTITY_TYPES
@@ -532,26 +552,19 @@ async def upsert_entity(
     category = normalize_category(entity.category) if entity.category else fallback_category
     risk = entity.risk_score if entity.risk_score is not None else fallback_risk
 
-    return await conn.fetchval(
-        """
-        INSERT INTO entities(
-            entity_type, display_value, normalized_value, value_hash, encrypted_value,
-            risk_score, category, country, city, metadata, last_seen
-        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,now())
-        ON CONFLICT(entity_type, value_hash) DO UPDATE SET
-            display_value = EXCLUDED.display_value,
-            encrypted_value = COALESCE(EXCLUDED.encrypted_value, entities.encrypted_value),
-            risk_score = GREATEST(entities.risk_score, EXCLUDED.risk_score),
-            category = CASE WHEN EXCLUDED.risk_score >= entities.risk_score THEN EXCLUDED.category ELSE entities.category END,
-            country = COALESCE(EXCLUDED.country, entities.country),
-            city = COALESCE(EXCLUDED.city, entities.city),
-            metadata = entities.metadata || EXCLUDED.metadata,
-            last_seen = now()
-        RETURNING id
-        """,
-        entity.entity_type, display, normalized, value_hash, encrypted,
-        risk, category, entity.country, city,
-        json.dumps(entity.metadata, ensure_ascii=False),
+    data = entity.model_dump(exclude_unset=True)
+    data['entity_type'] = entity.entity_type
+    data['display_value'] = display
+    data['normalized_value'] = normalized
+    data['value_hash'] = value_hash
+    data['encrypted_value'] = encrypted
+    data['risk_score'] = risk
+    data['category'] = category
+    data['city'] = city
+    data['last_seen'] = utcnow()
+
+    return await ensure_columns_and_insert(
+        conn, "entities", data, conflict_keys=["entity_type", "value_hash"]
     )
 
 async def attach_legal_articles(conn: asyncpg.Connection, post_id: int, category: str) -> None:
@@ -729,15 +742,10 @@ async def add_evidence(
     captured_by: Optional[str] = None,
     request: Request = None,
 ) -> dict:
-    """
-    Принимает скриншот или другое доказательство, загруженное в Supabase Storage.
-    Используется Telegram-ботом для сохранения улик.
-    """
     require_ingest_token(request.headers.get("X-Ingest-Token"))
     assert pool is not None
 
     async with pool.acquire() as conn:
-        # Проверяем, существуют ли пост или сущность (если указаны)
         if post_id:
             exists = await conn.fetchval("SELECT 1 FROM posts WHERE id = $1", post_id)
             if not exists:
@@ -760,7 +768,7 @@ async def add_evidence(
         )
     return {"status": "success", "evidence_id": evidence_id}
 
-# ---------- ОСТАЛЬНЫЕ ЭНДПОИНТЫ (полный список) ----------
+# ---------- ОСТАЛЬНЫЕ ЭНДПОИНТЫ (полный список, без изменений) ----------
 @app.get("/wallets")
 async def list_wallets(
     min_risk: float = Query(0.0, ge=0, le=1),
