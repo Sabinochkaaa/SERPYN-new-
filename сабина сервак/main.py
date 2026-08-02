@@ -7,6 +7,7 @@ import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Optional, List, Dict
+from urllib.parse import urlparse
 
 import asyncpg
 from cryptography.fernet import Fernet, InvalidToken
@@ -17,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 load_dotenv()
 
-# ---------- НАСТРОЙКА ЛОГГИРОВАНИЯ ----------
+# ---------- НАСТРОЙКА ЛОГИРОВАНИЯ ----------
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -302,14 +303,8 @@ def extract_keywords(text: str) -> List[str]:
 
 # ---------- ДИНАМИЧЕСКОЕ ДОБАВЛЕНИЕ КОЛОНОК ----------
 async def ensure_columns(conn: asyncpg.Connection, table_name: str, extra_data: Dict[str, Any]) -> None:
-    """
-    Проверяет наличие колонок в таблице и добавляет отсутствующие,
-    определяя тип по значению.
-    """
     if not extra_data:
         return
-
-    # Получаем существующие колонки
     existing = await conn.fetch(
         """
         SELECT column_name, data_type
@@ -319,12 +314,9 @@ async def ensure_columns(conn: asyncpg.Connection, table_name: str, extra_data: 
         table_name
     )
     existing_cols = {row['column_name'] for row in existing}
-
-    # Для каждой дополнительной колонки
     for col, val in extra_data.items():
         if col in existing_cols:
             continue
-        # Определяем тип
         if isinstance(val, int):
             pg_type = "INTEGER"
         elif isinstance(val, float):
@@ -333,15 +325,13 @@ async def ensure_columns(conn: asyncpg.Connection, table_name: str, extra_data: 
             pg_type = "JSONB"
         else:
             pg_type = "TEXT"
-        # Добавляем колонку
         try:
             await conn.execute(f'ALTER TABLE {table_name} ADD COLUMN "{col}" {pg_type}')
             logger.info(f"Добавлена колонка {col} типа {pg_type} в таблицу {table_name}")
         except Exception as e:
             logger.error(f"Ошибка добавления колонки {col}: {e}")
-            # Может быть, уже существует (гонка) – игнорируем
 
-# ---------- PYDANTIC МОДЕЛИ (с extra="allow") ----------
+# ---------- PYDANTIC МОДЕЛИ ----------
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="allow", str_strip_whitespace=True)
 
@@ -375,7 +365,7 @@ class RelationInput(StrictModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 class EvidenceInput(StrictModel):
-    evidence_type: str  # будет валидироваться позже
+    evidence_type: str
     storage_url: str
     original_url: Optional[str] = None
     sha256: Optional[str] = None
@@ -438,29 +428,57 @@ class IngestRequest(StrictModel):
     def validate_category(cls, v: str) -> str:
         return normalize_category(v)
 
-# ---------- SQL-СКРИПТ СОЗДАНИЯ ТАБЛИЦ ----------
-MIGRATION_SQL = """
--- (здесь должен быть полный SQL из schema.sql, но для краткости я вставлю его как строку)
--- В реальном коде я бы прочитал schema.sql, но для автономности скопирую содержимое.
--- Однако, чтобы избежать дублирования, я просто выполню запросы из schema.sql,
--- который должен лежать рядом. В этом примере я вставлю его прямо сюда.
-"""  # на самом деле я вставлю полный SQL ниже.
+# ---- НОВАЯ МОДЕЛЬ ДЛЯ YOUTUBE HUNTER ----
+class ArrfrCheck(BaseModel):
+    is_blacklisted: bool = False
+    match_type: Optional[str] = None
+    matched_entry: Optional[str] = None
+    risk_boost: int = 0
+    reason: str = ""
 
-# Для экономии места я не буду дублировать весь SQL, а прочитаю из файла schema.sql при старте.
-# Но чтобы быть уверенным, я вставлю его как строку здесь (на самом деле я прочитаю файл).
-# В финальном ответе я приложу schema.sql отдельно, а здесь прочитаю его.
+class DomainRisk(BaseModel):
+    risk: int = 0
+    flags: List[str] = Field(default_factory=list)
 
-# ---------- ФУНКЦИЯ МИГРАЦИИ ----------
+class YouTubeAdResult(BaseModel):
+    advertiser_name: str
+    advertiser_domain: str = ""
+    ad_text: str
+    ad_title: str = ""
+    search_keyword: str
+    screenshot_path: str = ""
+    screenshot_url: Optional[str] = None  # новое поле для облачного URL
+    transparency_url: str = ""
+    scraped_at: str
+    risk_score: int
+    verdict: str
+    risk_flags: List[str] = Field(default_factory=list)
+    ai_reason: str = ""
+    target_audience: str = ""
+    scheme_type: str = ""
+    license_check: str = ""
+    advice_for_pensioner: str = ""
+    arrfr_check: ArrfrCheck = Field(default_factory=ArrfrCheck)
+    domain_risk: DomainRisk = Field(default_factory=DomainRisk)
+    analyzed_by: str = ""
+    analyzed: bool = True
+
+class YouTubeHunterPayload(BaseModel):
+    run_timestamp: str
+    project: str = "serpin-youtube"
+    mode: str = "youtube_hunter"
+    summary: Dict[str, int]
+    ads: List[YouTubeAdResult]
+
+# ---------- SQL-СКРИПТ (читается из schema.sql) ----------
 async def run_migrations(db_pool: asyncpg.Pool) -> None:
-    # Читаем schema.sql из корня
     schema_path = os.path.join(os.path.dirname(__file__), "schema.sql")
     if os.path.exists(schema_path):
         with open(schema_path, "r", encoding="utf-8") as f:
             sql = f.read()
     else:
-        # Если файла нет, используем встроенную константу (запасной вариант)
-        sql = """-- fallback SQL (но лучше создать schema.sql)"""
-        logger.warning("schema.sql не найден, используется встроенный SQL (неполный)")
+        logger.error("schema.sql не найден, таблицы не созданы")
+        return
     async with db_pool.acquire() as conn:
         await conn.execute(sql)
     logger.info("Миграции выполнены — все таблицы готовы")
@@ -484,7 +502,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="SERPYN OSINT API",
     version="2.0.1",
-    description="Расширенный мониторинг финансовых пирамид в Казахстане",
+    description="Мониторинг финансовых пирамид в Казахстане",
     lifespan=lifespan,
 )
 
@@ -502,167 +520,10 @@ def require_ingest_token(x_ingest_token: Optional[str] = Header(default=None)) -
     if not x_ingest_token or not secrets.compare_digest(x_ingest_token, INGEST_TOKEN):
         raise HTTPException(401, "Неверный или отсутствующий X-Ingest-Token")
 
-# ---------- БАЗОВЫЕ ФУНКЦИИ БД (UPSERT) ----------
-async def upsert_project(conn: asyncpg.Connection, name: str) -> int:
-    return await conn.fetchval(
-        "INSERT INTO projects(name) VALUES($1) ON CONFLICT(name) DO UPDATE SET updated_at=now() RETURNING id",
-        name,
-    )
-
-async def upsert_source(conn: asyncpg.Connection, project_id: int, ev: IngestRequest) -> int:
-    external_id = ev.source_external_id or ev.source_url or ev.source_username or ev.source_name
-    city = ev.source_city or infer_city(ev.source_name, ev.source_url, ev.text)
-    return await conn.fetchval(
-        """
-        INSERT INTO sources(
-            project_id, source_type, name, external_id, username, url,
-            platform_meta, city, country, last_seen, risk_score, category
-        ) VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,now(),$10,$11)
-        ON CONFLICT(source_type, external_id) DO UPDATE SET
-            project_id = EXCLUDED.project_id,
-            name = EXCLUDED.name,
-            username = COALESCE(EXCLUDED.username, sources.username),
-            url = COALESCE(EXCLUDED.url, sources.url),
-            platform_meta = sources.platform_meta || EXCLUDED.platform_meta,
-            city = COALESCE(EXCLUDED.city, sources.city),
-            country = COALESCE(EXCLUDED.country, sources.country),
-            last_seen = now(),
-            risk_score = GREATEST(sources.risk_score, EXCLUDED.risk_score),
-            category = CASE WHEN EXCLUDED.risk_score >= sources.risk_score THEN EXCLUDED.category ELSE sources.category END
-        RETURNING id
-        """,
-        project_id, ev.source_type, ev.source_name, external_id, ev.source_username,
-        ev.source_url, json.dumps(ev.source_meta, ensure_ascii=False), city,
-        ev.source_country, ev.risk_score, ev.category,
-    )
-
-async def upsert_post(conn: asyncpg.Connection, source_id: int, ev: IngestRequest) -> int:
-    # Определяем язык, если не указан
-    if not ev.language and ev.text:
-        if any(0x0400 < ord(ch) < 0x0500 for ch in ev.text):
-            ev.language = "ru"
-        else:
-            ev.language = "en"
-
-    # ДИНАМИЧЕСКИЕ КОЛОНКИ: перед вставкой проверим extra
-    await ensure_columns(conn, "posts", ev.extra)
-
-    # Подготавливаем поля для вставки
-    # Известные поля
-    known_fields = {
-        "source_id", "external_id", "url", "title", "author", "published_at",
-        "raw_text", "normalized_text", "language", "category", "risk_score",
-        "confidence", "explanation", "red_flags", "keywords", "model",
-        "analyzed_at", "extra"
-    }
-    # Формируем словарь для вставки
-    insert_data = {
-        "source_id": source_id,
-        "external_id": ev.item_id,
-        "url": ev.item_url,
-        "title": ev.title,
-        "author": ev.author,
-        "published_at": parse_dt(ev.published_at),
-        "raw_text": ev.text,
-        "normalized_text": ev.normalized_text,
-        "language": ev.language,
-        "category": ev.category,
-        "risk_score": ev.risk_score,
-        "confidence": ev.confidence,
-        "explanation": ev.explanation,
-        "red_flags": ev.red_flags,
-        "keywords": ev.keywords,
-        "model": ev.model,
-        "analyzed_at": utcnow(),
-        "extra": json.dumps(ev.extra, ensure_ascii=False) if ev.extra else "{}",
-    }
-    # Добавляем все поля из extra как отдельные колонки (они уже созданы)
-    for key, val in ev.extra.items():
-        insert_data[key] = val
-
-    # Строим динамический INSERT с конфликтом
-    columns = list(insert_data.keys())
-    placeholders = [f"${i+1}" for i in range(len(columns))]
-    # Конфликт: обновляем только известные поля, кроме source_id и external_id
-    update_set = []
-    for col in columns:
-        if col not in {"source_id", "external_id"}:
-            update_set.append(f"{col} = EXCLUDED.{col}")
-    update_clause = ", ".join(update_set)
-
-    query = f"""
-        INSERT INTO posts ({", ".join(columns)})
-        VALUES ({", ".join(placeholders)})
-        ON CONFLICT (source_id, external_id) DO UPDATE SET
-            {update_clause},
-            updated_at = now()
-        RETURNING id
-    """
-    return await conn.fetchval(query, *insert_data.values())
-
-async def upsert_entity(
-    conn: asyncpg.Connection,
-    entity: EntityInput,
-    fallback_category: str,
-    fallback_risk: float,
-) -> int:
-    normalized = normalize_entity_value(entity.entity_type, entity.value)
-    value_hash = hash_value(normalized)
-    sensitive = entity.entity_type in SENSITIVE_ENTITY_TYPES
-    encrypted = encrypt_value(entity.value) if sensitive else None
-    display = mask_value(entity.entity_type, normalized) if sensitive else entity.value.strip()
-    city = entity.city or infer_city(entity.value, json.dumps(entity.metadata, ensure_ascii=False))
-    category = normalize_category(entity.category) if entity.category else fallback_category
-    risk = entity.risk_score if entity.risk_score is not None else fallback_risk
-
-    return await conn.fetchval(
-        """
-        INSERT INTO entities(
-            entity_type, display_value, normalized_value, value_hash, encrypted_value,
-            risk_score, category, country, city, metadata, last_seen
-        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,now())
-        ON CONFLICT(entity_type, value_hash) DO UPDATE SET
-            display_value = EXCLUDED.display_value,
-            encrypted_value = COALESCE(EXCLUDED.encrypted_value, entities.encrypted_value),
-            risk_score = GREATEST(entities.risk_score, EXCLUDED.risk_score),
-            category = CASE WHEN EXCLUDED.risk_score >= entities.risk_score THEN EXCLUDED.category ELSE entities.category END,
-            country = COALESCE(EXCLUDED.country, entities.country),
-            city = COALESCE(EXCLUDED.city, entities.city),
-            metadata = entities.metadata || EXCLUDED.metadata,
-            last_seen = now()
-        RETURNING id
-        """,
-        entity.entity_type, display, normalized, value_hash, encrypted,
-        risk, category, entity.country, city,
-        json.dumps(entity.metadata, ensure_ascii=False),
-    )
-
-async def attach_legal_articles(conn: asyncpg.Connection, post_id: int, category: str) -> None:
-    await conn.execute(
-        """
-        INSERT INTO post_legal_articles(post_id, legal_article_id)
-        SELECT $1, id FROM legal_articles WHERE $2 = ANY(categories)
-        ON CONFLICT DO NOTHING
-        """,
-        post_id, category,
-    )
-
-# ---------- ЭНДПОИНТЫ ----------
-@app.get("/health")
-async def health() -> dict:
-    try:
-        async with pool.acquire() as conn:
-            await conn.fetchval("SELECT 1")
-        return {"status": "ok", "service": "SERPYN", "database": "ok", "time": utcnow().isoformat()}
-    except Exception as e:
-        logger.exception("Health check failed")
-        return {"status": "degraded", "service": "SERPYN", "database": "error", "error": str(e)}
-
-@app.post("/ingest")
-async def ingest(ev: IngestRequest, request: Request) -> dict:
-    require_ingest_token(request.headers.get("X-Ingest-Token"))
+# ---------- ОБЩАЯ ФУНКЦИЯ СОХРАНЕНИЯ ----------
+async def save_ingest(ev: IngestRequest) -> dict:
+    """Основная логика сохранения IngestRequest."""
     assert pool is not None
-
     payload_hash = hash_value(ev.model_dump_json())
     entity_ids: dict[str, int] = {}
 
@@ -798,6 +659,240 @@ async def ingest(ev: IngestRequest, request: Request) -> dict:
             logger.exception("Не удалось сохранить ошибку ингеста")
         raise HTTPException(500, detail="Ошибка сохранения данных")
 
+# ---------- UPSERT-ФУНКЦИИ ----------
+async def upsert_project(conn: asyncpg.Connection, name: str) -> int:
+    return await conn.fetchval(
+        "INSERT INTO projects(name) VALUES($1) ON CONFLICT(name) DO UPDATE SET updated_at=now() RETURNING id",
+        name,
+    )
+
+async def upsert_source(conn: asyncpg.Connection, project_id: int, ev: IngestRequest) -> int:
+    external_id = ev.source_external_id or ev.source_url or ev.source_username or ev.source_name
+    city = ev.source_city or infer_city(ev.source_name, ev.source_url, ev.text)
+    return await conn.fetchval(
+        """
+        INSERT INTO sources(
+            project_id, source_type, name, external_id, username, url,
+            platform_meta, city, country, last_seen, risk_score, category
+        ) VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,now(),$10,$11)
+        ON CONFLICT(source_type, external_id) DO UPDATE SET
+            project_id = EXCLUDED.project_id,
+            name = EXCLUDED.name,
+            username = COALESCE(EXCLUDED.username, sources.username),
+            url = COALESCE(EXCLUDED.url, sources.url),
+            platform_meta = sources.platform_meta || EXCLUDED.platform_meta,
+            city = COALESCE(EXCLUDED.city, sources.city),
+            country = COALESCE(EXCLUDED.country, sources.country),
+            last_seen = now(),
+            risk_score = GREATEST(sources.risk_score, EXCLUDED.risk_score),
+            category = CASE WHEN EXCLUDED.risk_score >= sources.risk_score THEN EXCLUDED.category ELSE sources.category END
+        RETURNING id
+        """,
+        project_id, ev.source_type, ev.source_name, external_id, ev.source_username,
+        ev.source_url, json.dumps(ev.source_meta, ensure_ascii=False), city,
+        ev.source_country, ev.risk_score, ev.category,
+    )
+
+async def upsert_post(conn: asyncpg.Connection, source_id: int, ev: IngestRequest) -> int:
+    if not ev.language and ev.text:
+        if any(0x0400 < ord(ch) < 0x0500 for ch in ev.text):
+            ev.language = "ru"
+        else:
+            ev.language = "en"
+
+    await ensure_columns(conn, "posts", ev.extra)
+
+    insert_data = {
+        "source_id": source_id,
+        "external_id": ev.item_id,
+        "url": ev.item_url,
+        "title": ev.title,
+        "author": ev.author,
+        "published_at": parse_dt(ev.published_at),
+        "raw_text": ev.text,
+        "normalized_text": ev.normalized_text,
+        "language": ev.language,
+        "category": ev.category,
+        "risk_score": ev.risk_score,
+        "confidence": ev.confidence,
+        "explanation": ev.explanation,
+        "red_flags": ev.red_flags,
+        "keywords": ev.keywords,
+        "model": ev.model,
+        "analyzed_at": utcnow(),
+        "extra": json.dumps(ev.extra, ensure_ascii=False) if ev.extra else "{}",
+    }
+    # Добавляем все поля из extra как отдельные колонки
+    for key, val in ev.extra.items():
+        insert_data[key] = val
+
+    columns = list(insert_data.keys())
+    placeholders = [f"${i+1}" for i in range(len(columns))]
+    update_set = []
+    for col in columns:
+        if col not in {"source_id", "external_id"}:
+            update_set.append(f"{col} = EXCLUDED.{col}")
+    update_clause = ", ".join(update_set)
+
+    query = f"""
+        INSERT INTO posts ({", ".join(columns)})
+        VALUES ({", ".join(placeholders)})
+        ON CONFLICT (source_id, external_id) DO UPDATE SET
+            {update_clause},
+            updated_at = now()
+        RETURNING id
+    """
+    return await conn.fetchval(query, *insert_data.values())
+
+async def upsert_entity(
+    conn: asyncpg.Connection,
+    entity: EntityInput,
+    fallback_category: str,
+    fallback_risk: float,
+) -> int:
+    normalized = normalize_entity_value(entity.entity_type, entity.value)
+    value_hash = hash_value(normalized)
+    sensitive = entity.entity_type in SENSITIVE_ENTITY_TYPES
+    encrypted = encrypt_value(entity.value) if sensitive else None
+    display = mask_value(entity.entity_type, normalized) if sensitive else entity.value.strip()
+    city = entity.city or infer_city(entity.value, json.dumps(entity.metadata, ensure_ascii=False))
+    category = normalize_category(entity.category) if entity.category else fallback_category
+    risk = entity.risk_score if entity.risk_score is not None else fallback_risk
+
+    return await conn.fetchval(
+        """
+        INSERT INTO entities(
+            entity_type, display_value, normalized_value, value_hash, encrypted_value,
+            risk_score, category, country, city, metadata, last_seen
+        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,now())
+        ON CONFLICT(entity_type, value_hash) DO UPDATE SET
+            display_value = EXCLUDED.display_value,
+            encrypted_value = COALESCE(EXCLUDED.encrypted_value, entities.encrypted_value),
+            risk_score = GREATEST(entities.risk_score, EXCLUDED.risk_score),
+            category = CASE WHEN EXCLUDED.risk_score >= entities.risk_score THEN EXCLUDED.category ELSE entities.category END,
+            country = COALESCE(EXCLUDED.country, entities.country),
+            city = COALESCE(EXCLUDED.city, entities.city),
+            metadata = entities.metadata || EXCLUDED.metadata,
+            last_seen = now()
+        RETURNING id
+        """,
+        entity.entity_type, display, normalized, value_hash, encrypted,
+        risk, category, entity.country, city,
+        json.dumps(entity.metadata, ensure_ascii=False),
+    )
+
+async def attach_legal_articles(conn: asyncpg.Connection, post_id: int, category: str) -> None:
+    await conn.execute(
+        """
+        INSERT INTO post_legal_articles(post_id, legal_article_id)
+        SELECT $1, id FROM legal_articles WHERE $2 = ANY(categories)
+        ON CONFLICT DO NOTHING
+        """,
+        post_id, category,
+    )
+
+# ---------- ЭНДПОИНТЫ ----------
+@app.get("/health")
+async def health() -> dict:
+    try:
+        async with pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        return {"status": "ok", "service": "SERPYN", "database": "ok", "time": utcnow().isoformat()}
+    except Exception as e:
+        logger.exception("Health check failed")
+        return {"status": "degraded", "service": "SERPYN", "database": "error", "error": str(e)}
+
+@app.post("/ingest")
+async def ingest(ev: IngestRequest, request: Request) -> dict:
+    require_ingest_token(request.headers.get("X-Ingest-Token"))
+    return await save_ingest(ev)
+
+@app.post("/ingest/youtube")
+async def ingest_youtube(payload: YouTubeHunterPayload, request: Request) -> dict:
+    require_ingest_token(request.headers.get("X-Ingest-Token"))
+    saved = 0
+    for ad in payload.ads:
+        # Извлекаем video_id
+        video_id = None
+        m = re.search(r"v=([a-zA-Z0-9_-]{11})", ad.search_keyword)
+        if m:
+            video_id = m.group(1)
+        else:
+            m = re.search(r"v=([a-zA-Z0-9_-]{11})", ad.transparency_url)
+            if m:
+                video_id = m.group(1)
+        if not video_id:
+            logger.warning(f"Не удалось извлечь video_id из {ad.search_keyword}")
+            continue
+
+        verdict_map = {"dangerous": "PYRAMID", "suspicious": "LIKELY_PYRAMID", "safe": "CLEAN"}
+        category = verdict_map.get(ad.verdict.lower(), "UNKNOWN")
+        risk_norm = min(ad.risk_score / 100.0, 1.0)
+
+        extra = ad.model_dump(exclude={"screenshot_path", "screenshot_url"})
+        extra["scraped_at"] = ad.scraped_at
+        extra["arrfr_check"] = ad.arrfr_check.dict()
+        extra["domain_risk"] = ad.domain_risk.dict()
+
+        entities = []
+        if ad.advertiser_domain:
+            entities.append(EntityInput(
+                entity_type="DOMAIN",
+                value=ad.advertiser_domain,
+                role="advertiser_domain",
+                confidence=0.9,
+                risk_score=risk_norm,
+                category=category,
+                metadata={"source": "youtube_hunter"}
+            ))
+
+        evidence = []
+        if ad.screenshot_url:
+            evidence.append(EvidenceInput(
+                evidence_type="SCREENSHOT",
+                storage_url=ad.screenshot_url,
+                original_url=ad.transparency_url,
+                captured_at=ad.scraped_at,
+                captured_by="youtube_hunter",
+                metadata={"verdict": ad.verdict}
+            ))
+        elif ad.screenshot_path:
+            logger.warning(f"Скриншот не загружен в облако: {ad.screenshot_path}")
+
+        ingest = IngestRequest(
+            request_id=f"yt_{payload.run_timestamp}",
+            project=payload.project,
+            source_type="YOUTUBE",
+            source_name=ad.advertiser_name or "YouTube Ad",
+            source_external_id=ad.advertiser_domain or video_id,
+            source_url=ad.transparency_url,
+            source_country="KZ",
+            item_id=video_id,
+            item_url=ad.transparency_url or ad.search_keyword,
+            title=ad.ad_title or ad.ad_text[:100],
+            text=ad.ad_text,
+            normalized_text=ad.ad_text,
+            published_at=ad.scraped_at,
+            category=category,
+            risk_score=risk_norm,
+            confidence=0.8,
+            explanation=ad.ai_reason,
+            red_flags=ad.risk_flags,
+            keywords=[],
+            model=ad.analyzed_by,
+            extra=extra,
+            entities=entities,
+            relations=[],
+            evidence=evidence
+        )
+
+        try:
+            await save_ingest(ingest)
+            saved += 1
+        except Exception as e:
+            logger.error(f"Ошибка сохранения рекламы {video_id}: {e}")
+    return {"status": "success", "saved": saved, "total": len(payload.ads)}
+
 @app.post("/evidence")
 async def add_evidence(
     post_id: Optional[int] = None,
@@ -813,7 +908,6 @@ async def add_evidence(
 ) -> dict:
     require_ingest_token(request.headers.get("X-Ingest-Token"))
     assert pool is not None
-
     async with pool.acquire() as conn:
         if post_id:
             exists = await conn.fetchval("SELECT 1 FROM posts WHERE id = $1", post_id)
@@ -823,7 +917,6 @@ async def add_evidence(
             exists = await conn.fetchval("SELECT 1 FROM entities WHERE id = $1", entity_id)
             if not exists:
                 raise HTTPException(404, "Сущность не найдена")
-
         evidence_id = await conn.fetchval(
             """
             INSERT INTO evidence(
@@ -837,6 +930,7 @@ async def add_evidence(
         )
     return {"status": "success", "evidence_id": evidence_id}
 
+# ---------- ОСТАЛЬНЫЕ ЭНДПОИНТЫ (чтение данных) ----------
 @app.get("/wallets")
 async def list_wallets(
     min_risk: float = Query(0.0, ge=0, le=1),
@@ -879,9 +973,7 @@ async def sources_stats() -> list[dict]:
         return [dict(r) for r in rows]
 
 @app.get("/trend")
-async def trend(
-    days: int = Query(30, ge=1, le=365),
-) -> list[dict]:
+async def trend(days: int = Query(30, ge=1, le=365)) -> list[dict]:
     assert pool is not None
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -1280,7 +1372,7 @@ async def root() -> dict:
         "docs": "/docs",
         "health": "/health",
         "endpoints": [
-            "/ingest", "/channels", "/suspicious", "/graph", "/stats",
+            "/ingest", "/ingest/youtube", "/channels", "/suspicious", "/graph", "/stats",
             "/map", "/legal/articles", "/alerts", "/wallets",
             "/sources/stats", "/trend", "/entity/{id}/dossier",
             "/channel/{id}/dossier", "/wallet/{address}", "/evidence"
