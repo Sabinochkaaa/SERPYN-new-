@@ -350,14 +350,16 @@ async def ensure_columns(conn: asyncpg.Connection, table_name: str, extra_data: 
     existing_cols = {row['column_name'] for row in existing}
     for col, val in extra_data.items():
         if col in existing_cols:
+            # Если колонка уже существует, но имеет другой тип – можно пропустить
             continue
-        # Всегда создаём TEXT (чтобы избежать конфликтов типов)
+        # Всегда создаём TEXT
         pg_type = "TEXT"
         try:
             await conn.execute(f'ALTER TABLE {table_name} ADD COLUMN "{col}" {pg_type}')
             logger.info(f"Добавлена колонка {col} типа {pg_type} в таблицу {table_name}")
         except Exception as e:
             logger.error(f"Ошибка добавления колонки {col}: {e}")
+        
         
 
 # ---------- TELEGRAM УВЕДОМЛЕНИЯ ----------
@@ -652,15 +654,16 @@ async def upsert_post(conn: asyncpg.Connection, source_id: int, ev: IngestReques
         else:
             ev.language = "en"
 
-    # Преобразуем extra в JSON-строки перед созданием колонок
+    # 🔥 Ключевое: сериализуем все значения из extra в JSON-строки
     extra_serialized = {}
     for key, val in ev.extra.items():
         if not isinstance(val, str):
+            # Любой нестроковый объект (список, словарь, число) превращаем в JSON-строку
             extra_serialized[key] = json.dumps(val, ensure_ascii=False)
         else:
             extra_serialized[key] = val
 
-    # Теперь вызываем ensure_columns с сериализованными данными
+    # Теперь создаём колонки (все будут TEXT)
     await ensure_columns(conn, "posts", extra_serialized)
 
     insert_data = {
@@ -684,7 +687,7 @@ async def upsert_post(conn: asyncpg.Connection, source_id: int, ev: IngestReques
         "extra": json.dumps(ev.extra, ensure_ascii=False) if ev.extra else "{}",
     }
 
-    # Добавляем все сериализованные поля из extra как отдельные колонки
+    # Добавляем сериализованные поля как отдельные колонки
     for key, val in extra_serialized.items():
         insert_data[key] = val
 
