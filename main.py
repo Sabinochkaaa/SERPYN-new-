@@ -495,21 +495,41 @@ async def send_telegram_alert(
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
-            payload = {
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message,
-                "parse_mode": "Markdown",
-                "disable_web_page_preview": True,
-            }
-            if reply_markup:
-                payload["reply_markup"] = reply_markup
-            await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json=payload)
+            # Если есть скриншоты — отправляем ПЕРВОЕ фото с полным текстом в caption
             if evidence_urls:
-                for url in evidence_urls[:10]:
+                first_url = evidence_urls[0]
+                await client.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+                    json={
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "photo": first_url,
+                        "caption": message,
+                        "parse_mode": "Markdown",
+                        "reply_markup": reply_markup,
+                    },
+                )
+                # Остальные фото (если есть) отправляем без подписи или с краткой
+                for url in evidence_urls[1:10]:
                     await client.post(
                         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-                        json={"chat_id": TELEGRAM_CHAT_ID, "photo": url, "caption": f"📸 {(title or '')[:60]}"},
+                        json={
+                            "chat_id": TELEGRAM_CHAT_ID,
+                            "photo": url,
+                            "caption": "📸 Дополнительный скриншот",
+                        },
                     )
+            else:
+                # Если скриншотов нет — отправляем только текст
+                payload = {
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": message,
+                    "parse_mode": "Markdown",
+                    "disable_web_page_preview": True,
+                }
+                if reply_markup:
+                    payload["reply_markup"] = reply_markup
+                await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json=payload)
+
             logger.info("Telegram-уведомление отправлено")
         except Exception:
             logger.exception("Ошибка отправки Telegram-уведомления")
