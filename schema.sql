@@ -266,3 +266,32 @@ INSERT INTO tags (name, label_ru, label_kk, label_en) VALUES
 ('fake_documents', 'Поддельные документы', 'Жалған құжаттар', 'Fake documents'),
 ('job_without_qualifications', 'Работа без квалификации', 'Біліктіліксіз жұмыс', 'Job without qualifications')
 ON CONFLICT (name) DO NOTHING;
+-- Форекс/бинарки
+INSERT INTO categories (code, category_group, name_ru, name_kk, name_en, default_severity)
+VALUES ('FOREX_SCAM', 'FINANCE', 'Форекс/бинарки', 'Форекс/бинарлық', 'Forex/Binary options', 'HIGH')
+ON CONFLICT (code) DO NOTHING;
+
+-- Фейк гос. выплаты
+INSERT INTO categories (code, category_group, name_ru, name_kk, name_en, default_severity)
+VALUES ('FAKE_STATE', 'FINANCE', 'Гос. выплаты фейк', 'Мемлекеттік төлемдер жалған', 'Fake state payments', 'HIGH')
+ON CONFLICT (code) DO NOTHING;
+
+-- Фейк займы
+INSERT INTO categories (code, category_group, name_ru, name_kk, name_en, default_severity)
+VALUES ('FAKE_LOAN', 'FINANCE', 'Фейк займы', 'Жалған несие', 'Fake loans', 'HIGH')
+ON CONFLICT (code) DO NOTHING;
+
+-- Пенсионная схема
+INSERT INTO categories (code, category_group, name_ru, name_kk, name_en, default_severity)
+VALUES ('PENSION_SCAM', 'FINANCE', 'Пенсионная схема', 'Зейнетақы схемасы', 'Pension scam', 'HIGH')
+ON CONFLICT (code) DO NOTHING;
+
+-- Общий скам (если хотите отдельно от OTHER_SCAM)
+INSERT INTO categories (code, category_group, name_ru, name_kk, name_en, default_severity)
+VALUES ('GENERAL_SCAM', 'SCAM', 'Общий скам', 'Жалпы алаяқтық', 'General scam', 'MEDIUM')
+ON CONFLICT (code) DO NOTHING;
+
+-- Другое (если хотите отдельно от UNKNOWN)
+INSERT INTO categories (code, category_group, name_ru, name_kk, name_en, default_severity)
+VALUES ('OTHER', 'OTHER', 'Другое', 'Басқа', 'Other', 'LOW')
+ON CONFLICT (code) DO NOTHING;
