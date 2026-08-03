@@ -351,19 +351,12 @@ async def ensure_columns(conn: asyncpg.Connection, table_name: str, extra_data: 
     for col, val in extra_data.items():
         if col in existing_cols:
             continue
-        if isinstance(val, int):
-            pg_type = "INTEGER"
-        elif isinstance(val, float):
-            pg_type = "NUMERIC"
-        elif isinstance(val, (dict, list)):
-            pg_type = "JSONB"
-        else:
-            pg_type = "TEXT"
         try:
-            await conn.execute(f'ALTER TABLE {table_name} ADD COLUMN "{col}" {pg_type}')
-            logger.info(f"Добавлена колонка {col} типа {pg_type} в таблицу {table_name}")
+            await conn.execute(f'ALTER TABLE {table_name} ADD COLUMN "{col}" TEXT')
+            logger.info(f"Добавлена колонка {col} типа TEXT в таблицу {table_name}")
         except Exception as e:
             logger.error(f"Ошибка добавления колонки {col}: {e}")
+        
 
 # ---------- TELEGRAM УВЕДОМЛЕНИЯ ----------
 async def send_telegram_alert(
@@ -657,7 +650,16 @@ async def upsert_post(conn: asyncpg.Connection, source_id: int, ev: IngestReques
         else:
             ev.language = "en"
 
-    await ensure_columns(conn, "posts", ev.extra)
+    # Сериализуем все значения из extra в JSON-строки
+    extra_serialized = {}
+    for key, val in ev.extra.items():
+        if not isinstance(val, str):
+            extra_serialized[key] = json.dumps(val, ensure_ascii=False)
+        else:
+            extra_serialized[key] = val
+
+    # Создаём колонки (все будут TEXT)
+    await ensure_columns(conn, "posts", extra_serialized)
 
     insert_data = {
         "source_id": source_id,
@@ -679,7 +681,9 @@ async def upsert_post(conn: asyncpg.Connection, source_id: int, ev: IngestReques
         "analyzed_at": utcnow(),
         "extra": json.dumps(ev.extra, ensure_ascii=False) if ev.extra else "{}",
     }
-    for key, val in ev.extra.items():
+
+    # Добавляем сериализованные поля как отдельные колонки
+    for key, val in extra_serialized.items():
         insert_data[key] = val
 
     columns = list(insert_data.keys())
@@ -699,6 +703,7 @@ async def upsert_post(conn: asyncpg.Connection, source_id: int, ev: IngestReques
         RETURNING id
     """
     return await conn.fetchval(query, *insert_data.values())
+
 
 async def upsert_entity(
     conn: asyncpg.Connection,
