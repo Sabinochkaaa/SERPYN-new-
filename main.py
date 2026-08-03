@@ -1,18 +1,3 @@
-"""
-SERPYN 2.0 — Анти-скам платформа
-Универсальный бэкенд для мониторинга рекламы и подозрительных постов
-во всех популярных соцсетях (YouTube, TikTok, Instagram, Telegram,
-Threads, Facebook, VK, сайты и т.д.).
-
-Особенности:
-  * Единый универсальный эндпоинт приёма данных /ingest (+ /ingest/youtube для совместимости)
-  * Динамические категории угроз (хранятся в БД, легко расширяются через /categories)
-  * Автоматическое извлечение и шифрование чувствительных сущностей
-  * Доказательная база (evidence) со скриншотами в Supabase Storage
-  * Telegram-уведомления обо всех новых находках
-  * Сервер устойчив к нестандартным/неполным входным данным — не падает с 500
-"""
-
 import base64
 import hashlib
 import json
@@ -36,7 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 load_dotenv()
 
 # ============================================================
-# ЛОГИРОВАНИЕ
+# НАСТРОЙКА ЛОГИРОВАНИЯ
 # ============================================================
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -52,70 +37,64 @@ INGEST_TOKEN = os.getenv("INGEST_TOKEN", "").strip()
 DATA_ENCRYPTION_KEY = os.getenv("DATA_ENCRYPTION_KEY", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-DASHBOARD_URL = os.getenv("DASHBOARD_URL", "").strip()
+DASHBOARD_URL = os.getenv("DASHBOARD_URL", "https://serpyn-serpyn.up.railway.app/").strip()
 CORS_ORIGINS = [x.strip() for x in os.getenv("CORS_ORIGINS", "*").split(",") if x.strip()]
 MAX_POOL_SIZE = int(os.getenv("DB_POOL_MAX_SIZE", "10"))
 
-# Порог для автоматического повышения категории CLEAN -> SUSPICIOUS -> угроза
 RISK_THRESHOLD_HIGH = float(os.getenv("RISK_THRESHOLD_HIGH", "0.75"))
 RISK_THRESHOLD_MEDIUM = float(os.getenv("RISK_THRESHOLD_MEDIUM", "0.5"))
-# Минимальный риск для отправки Telegram-алерта. По умолчанию 0 —
-# уведомление уходит по КАЖДОЙ новой находке (кроме категории CLEAN).
 ALERT_MIN_RISK = float(os.getenv("ALERT_MIN_RISK", "0.0"))
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "").strip()
 
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL не задан. Добавьте строку подключения PostgreSQL/Supabase.")
+    raise RuntimeError("DATABASE_URL не задан.")
 if not INGEST_TOKEN:
-    logger.warning("INGEST_TOKEN не задан: эндпоинты приёма данных не защищены!")
+    logger.warning("INGEST_TOKEN не задан – эндпоинты не защищены!")
 
 # ============================================================
-# ШИФРОВАНИЕ ЧУВСТВИТЕЛЬНЫХ ДАННЫХ
+# ШИФРОВАНИЕ
 # ============================================================
 fernet: Optional[Fernet] = None
 if DATA_ENCRYPTION_KEY:
     try:
         fernet = Fernet(DATA_ENCRYPTION_KEY.encode("utf-8"))
     except Exception as e:
-        raise RuntimeError("Неверный DATA_ENCRYPTION_KEY (должен быть Fernet-ключом).") from e
+        raise RuntimeError("Неверный DATA_ENCRYPTION_KEY.") from e
 else:
-    logger.warning("DATA_ENCRYPTION_KEY не задан: чувствительные данные НЕ будут шифроваться.")
+    logger.warning("DATA_ENCRYPTION_KEY не задан – чувствительные данные не шифруются.")
 
 # ============================================================
-# SUPABASE STORAGE КЛИЕНТ (для /upload_screenshot)
+# SUPABASE STORAGE КЛИЕНТ
 # ============================================================
 supabase_client = None
 if SUPABASE_URL and SUPABASE_SERVICE_KEY:
     try:
         from supabase import create_client
         supabase_client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+        logger.info("Supabase-клиент инициализирован")
     except Exception as e:
-        logger.error(f"Не удалось инициализировать Supabase-клиент: {e}")
+        logger.error(f"Ошибка инициализации Supabase: {e}")
 else:
-    logger.warning("SUPABASE_URL/SUPABASE_SERVICE_KEY не заданы: /upload_screenshot будет недоступен.")
+    logger.warning("SUPABASE_URL / SUPABASE_SERVICE_KEY не заданы – /upload_screenshot недоступен.")
 
 pool: Optional[asyncpg.Pool] = None
 
 # ============================================================
-# ДИНАМИЧЕСКИЕ КАТЕГОРИИ (кэш в памяти, источник истины — таблица categories)
+# КЭШ КАТЕГОРИЙ
 # ============================================================
-CATEGORY_CACHE: Dict[str, dict] = {}   # code -> {group, name_ru, name_kk, name_en, ...}
-FALLBACK_CATEGORY = "UNKNOWN"
+CATEGORY_CACHE: Dict[str, dict] = {}
 
 async def reload_category_cache() -> None:
-    """Перечитывает справочник категорий из БД в память."""
     global CATEGORY_CACHE
     assert pool is not None
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT * FROM categories WHERE is_active = true")
     CATEGORY_CACHE = {row["code"]: dict(row) for row in rows}
-    logger.info(f"Загружено {len(CATEGORY_CACHE)} категорий угроз в кэш")
+    logger.info(f"Загружено {len(CATEGORY_CACHE)} категорий в кэш")
 
 async def ensure_category_exists(code: str) -> None:
-    """Если категории нет в кэше — пробуем найти в БД (могла быть добавлена
-    другим воркером), иначе ничего не делаем (используется UNKNOWN)."""
     if code in CATEGORY_CACHE:
         return
     assert pool is not None
@@ -124,17 +103,20 @@ async def ensure_category_exists(code: str) -> None:
     if row:
         CATEGORY_CACHE[code] = dict(row)
 
-# Синонимы/ключевые слова на RU / KZ / EN -> код категории.
-# Используются для распознавания категории из свободного текста тегов.
+# ============================================================
+# СИНОНИМЫ КАТЕГОРИЙ (расширенный список)
+# ============================================================
 CATEGORY_ALIASES: Dict[str, str] = {
-    # --- финансовые пирамиды ---
+    # Финансы
     "пирамида": "PYRAMID", "финансовая пирамида": "PYRAMID",
     "қаржы пирамидасы": "PYRAMID", "қаржылық пирамида": "PYRAMID",
     "pyramid scheme": "PYRAMID", "financial pyramid": "PYRAMID",
     "понци": "PONZI", "ponzi": "PONZI", "понци схемасы": "PONZI",
     "mlm": "MLM_SCAM", "сетевой маркетинг": "MLM_SCAM", "желілік маркетинг": "MLM_SCAM",
-    "криптопирамида": "CRYPTO_PYRAMID", "крипто пирамида": "CRYPTO_PYRAMID", "crypto pyramid": "CRYPTO_PYRAMID",
-    "криптомошенничество": "CRYPTO_SCAM", "крипто алаяқтық": "CRYPTO_SCAM", "crypto scam": "CRYPTO_SCAM",
+    "криптопирамида": "CRYPTO_PYRAMID", "крипто пирамида": "CRYPTO_PYRAMID",
+    "crypto pyramid": "CRYPTO_PYRAMID",
+    "криптомошенничество": "CRYPTO_SCAM", "крипто алаяқтық": "CRYPTO_SCAM",
+    "crypto scam": "CRYPTO_SCAM",
     "гарантированный доход": "HIGH_YIELD", "кепілдік табыс": "HIGH_YIELD",
     "высокая доходность": "HIGH_YIELD", "жоғары табыстылық": "HIGH_YIELD",
     "пассивный доход": "HIGH_YIELD", "пассивті табыс": "HIGH_YIELD",
@@ -142,61 +124,75 @@ CATEGORY_ALIASES: Dict[str, str] = {
     "реферальная программа": "REFERRAL_SCHEME", "рефералдық бағдарлама": "REFERRAL_SCHEME",
     "партнёрская программа": "REFERRAL_SCHEME", "referral program": "REFERRAL_SCHEME",
     "инвестиционное мошенничество": "INVESTMENT_SCAM", "инвестициялық алаяқтық": "INVESTMENT_SCAM",
-    "investment scam": "INVESTMENT_SCAM", "инвестируй": "INVESTMENT_SCAM",
-    "фальшивый брокер": "FAKE_BROKER", "жалған брокер": "FAKE_BROKER", "fake broker": "FAKE_BROKER",
-    "поддельная биржа": "FAKE_EXCHANGE", "жалған биржа": "FAKE_EXCHANGE", "fake exchange": "FAKE_EXCHANGE",
+    "investment scam": "INVESTMENT_SCAM",
+    "инвестируй": "INVESTMENT_SCAM", "инвестировать": "INVESTMENT_SCAM",
+    "фальшивый брокер": "FAKE_BROKER", "жалған брокер": "FAKE_BROKER",
+    "fake broker": "FAKE_BROKER",
+    "поддельная биржа": "FAKE_EXCHANGE", "жалған биржа": "FAKE_EXCHANGE",
+    "fake exchange": "FAKE_EXCHANGE",
     "незарегистрированный фонд": "UNREGISTERED_FUND", "тіркелмеген қор": "UNREGISTERED_FUND",
-    "без лицензии": "UNLICENSED_FINANCE", "лицензиясыз": "UNLICENSED_FINANCE", "unlicensed": "UNLICENSED_FINANCE",
+    "без лицензии": "UNLICENSED_FINANCE", "лицензиясыз": "UNLICENSED_FINANCE",
+    "unlicensed": "UNLICENSED_FINANCE",
     "финансовое мошенничество": "FINANCIAL_FRAUD", "қаржылық алаяқтық": "FINANCIAL_FRAUD",
     "financial fraud": "FINANCIAL_FRAUD",
 
-    # --- наркотики ---
-    "наркотик": "DRUGS", "наркота": "DRUGS", "есірткі": "DRUGS", "drugs": "DRUGS", "drug sale": "DRUGS",
+    # Наркотики и закладчики
+    "наркотик": "DRUGS", "наркота": "DRUGS", "есірткі": "DRUGS",
+    "drugs": "DRUGS", "drug sale": "DRUGS",
     "кладмен": "DRUG_DEALER", "закладчик": "DRUG_DEALER", "закладка": "DRUG_DEALER",
     "клад": "DRUG_DEALER", "kladmen": "DRUG_DEALER", "dead drop": "DRUG_DEALER",
     "работа закладчиком": "DRUG_RECRUITMENT", "требуется курьер": "DRUG_RECRUITMENT",
     "лёгкий заработок курьером": "DRUG_RECRUITMENT",
 
-    # --- оружие ---
-    "оружие": "WEAPONS", "қару-жарақ": "WEAPONS", "weapon": "WEAPONS", "weapons sale": "WEAPONS",
+    # Оружие
+    "оружие": "WEAPONS", "қару-жарақ": "WEAPONS", "weapon": "WEAPONS",
+    "weapons sale": "WEAPONS", "продажа оружия": "WEAPONS",
 
-    # --- документы / подделки ---
-    "подделка документов": "FORGERY", "құжат жасау": "FORGERY", "document forgery": "FORGERY",
-    "фальшивые документы": "FORGERY", "жалған құжат": "FORGERY",
+    # Документы
+    "подделка документов": "FORGERY", "құжат жасау": "FORGERY",
+    "document forgery": "FORGERY", "фальшивые документы": "FORGERY",
+    "жалған құжат": "FORGERY",
     "права без экзамена": "FAKE_LICENSE", "купить диплом": "FAKE_LICENSE",
-    "жалған куәлік": "FAKE_LICENSE", "fake license": "FAKE_LICENSE", "fake diploma": "FAKE_LICENSE",
-    "контрафакт": "COUNTERFEIT", "контрафактілі өнім": "COUNTERFEIT", "counterfeit": "COUNTERFEIT",
-    "подделка товара": "COUNTERFEIT",
+    "жалған жүргізуші куәлігі": "FAKE_LICENSE", "fake license": "FAKE_LICENSE",
+    "fake diploma": "FAKE_LICENSE",
+    "контрафакт": "COUNTERFEIT", "контрафактілі өнім": "COUNTERFEIT",
+    "counterfeit": "COUNTERFEIT",
 
-    # --- онлайн-мошенничество ---
+    # Скам
     "фишинг": "PHISHING", "phishing": "PHISHING",
-    "фейк магазин": "FAKE_SHOP", "поддельный магазин": "FAKE_SHOP", "жалған дүкен": "FAKE_SHOP", "fake shop": "FAKE_SHOP",
-    "фейк работа": "FAKE_JOB", "ложная вакансия": "FAKE_JOB", "жалған жұмыс": "FAKE_JOB", "fake job": "FAKE_JOB",
-    "романтик скам": "ROMANCE_SCAM", "love scam": "ROMANCE_SCAM", "романтикалық алаяқтық": "ROMANCE_SCAM",
-    "кража данных": "IDENTITY_THEFT", "жеке деректерді ұрлау": "IDENTITY_THEFT", "identity theft": "IDENTITY_THEFT",
-    "фальшивая благотворительность": "FAKE_CHARITY", "жалған қайырымдылық": "FAKE_CHARITY", "fake charity": "FAKE_CHARITY",
-
-    # --- прочее незаконное ---
-    "азартные игры": "GAMBLING", "казино": "GAMBLING", "құмар ойын": "GAMBLING", "gambling": "GAMBLING",
-    "вымогательство": "EXTORTION", "рэкет": "EXTORTION", "бопсалау": "EXTORTION", "extortion": "EXTORTION",
-    "незаконные услуги": "ILLEGAL_SERVICES", "заңсыз қызмет": "ILLEGAL_SERVICES", "illegal services": "ILLEGAL_SERVICES",
-    "торговля людьми": "HUMAN_TRAFFICKING", "адам саудасы": "HUMAN_TRAFFICKING", "human trafficking": "HUMAN_TRAFFICKING",
+    "фейк магазин": "FAKE_SHOP", "поддельный магазин": "FAKE_SHOP",
+    "жалған дүкен": "FAKE_SHOP", "fake shop": "FAKE_SHOP",
+    "фейк работа": "FAKE_JOB", "ложная вакансия": "FAKE_JOB",
+    "жалған жұмыс": "FAKE_JOB", "fake job": "FAKE_JOB",
+    "романтик скам": "ROMANCE_SCAM", "love scam": "ROMANCE_SCAM",
+    "романтикалық алаяқтық": "ROMANCE_SCAM",
+    "кража данных": "IDENTITY_THEFT", "жеке деректерді ұрлау": "IDENTITY_THEFT",
+    "identity theft": "IDENTITY_THEFT",
+    "фальшивая благотворительность": "FAKE_CHARITY", "жалған қайырымдылық": "FAKE_CHARITY",
+    "fake charity": "FAKE_CHARITY",
+    "азартные игры": "GAMBLING", "казино": "GAMBLING", "құмар ойын": "GAMBLING",
+    "gambling": "GAMBLING",
+    "вымогательство": "EXTORTION", "рэкет": "EXTORTION", "бопсалау": "EXTORTION",
+    "extortion": "EXTORTION",
+    "незаконные услуги": "ILLEGAL_SERVICES", "заңсыз қызмет": "ILLEGAL_SERVICES",
+    "illegal services": "ILLEGAL_SERVICES",
+    "торговля людьми": "HUMAN_TRAFFICKING", "адам саудасы": "HUMAN_TRAFFICKING",
+    "human trafficking": "HUMAN_TRAFFICKING",
     "экстремизм": "EXTREMISM", "экстремистік": "EXTREMISM", "extremism": "EXTREMISM",
 
-    # --- нейтральные ---
+    # Общие
     "чисто": "CLEAN", "таза": "CLEAN", "clean": "CLEAN",
     "подозрительно": "SUSPICIOUS", "күдікті": "SUSPICIOUS", "suspicious": "SUSPICIOUS",
-    "скам": "OTHER_SCAM", "мошенничество": "OTHER_SCAM", "алаяқтық": "OTHER_SCAM", "scam": "OTHER_SCAM",
+    "скам": "OTHER_SCAM", "мошенничество": "OTHER_SCAM", "алаяқтық": "OTHER_SCAM",
+    "scam": "OTHER_SCAM",
 }
 
 def normalize_category(value: Optional[str]) -> str:
-    """Приводит произвольную категорию (RU/KZ/EN/код) к известному коду.
-    Никогда не бросает исключение — в худшем случае вернёт UNKNOWN."""
     if not value:
-        return FALLBACK_CATEGORY
+        return "UNKNOWN"
     raw = str(value).strip()
     if not raw:
-        return FALLBACK_CATEGORY
+        return "UNKNOWN"
     upper = re.sub(r"[^A-Za-z0-9_]+", "_", raw.upper()).strip("_")
     if upper in CATEGORY_CACHE:
         return upper
@@ -204,88 +200,10 @@ def normalize_category(value: Optional[str]) -> str:
     for alias, code in CATEGORY_ALIASES.items():
         if alias in low:
             return code
-    # частичное совпадение по существующим кодам категорий
     for code in CATEGORY_CACHE:
         if code.lower() in low or low in code.lower():
             return code
-    return FALLBACK_CATEGORY
-
-# ============================================================
-# ТИПЫ СУЩНОСТЕЙ И ИСТОЧНИКОВ (гибкие — неизвестное значение не ломает запрос)
-# ============================================================
-ENTITY_TYPES = {
-    "CHANNEL", "ACCOUNT", "PERSON", "COMPANY", "PROJECT", "WEBSITE", "DOMAIN",
-    "PHONE", "EMAIL", "BANK_CARD", "IBAN", "WALLET", "USERNAME", "ADDRESS",
-    "TELEGRAM_BOT", "WHATSAPP_NUMBER", "SOCIAL_MEDIA", "CRYPTO_EXCHANGE", "OTHER",
-}
-
-SOURCE_TYPES = {
-    "YOUTUBE", "TELEGRAM", "TIKTOK", "INSTAGRAM", "THREADS", "WEBSITE",
-    "NEWS", "FORUM", "COMPLAINT", "MANUAL", "OTHER", "FACEBOOK", "VK", "ODNOKLASSNIKI",
-    "TWITTER", "X", "LINKEDIN", "SNAPCHAT", "DISCORD", "WHATSAPP", "VIBER",
-}
-
-EVIDENCE_TYPES = {"SCREENSHOT", "IMAGE", "VIDEO", "HTML", "PDF", "ARCHIVE", "AUDIO", "OTHER"}
-
-SENSITIVE_ENTITY_TYPES = {"PHONE", "EMAIL", "BANK_CARD", "IBAN", "WALLET", "ADDRESS"}
-
-# Колонки posts, которые нельзя перезаписать через extra
-RESERVED_POST_COLUMNS = {
-    "id", "source_id", "external_id", "url", "title", "author", "published_at",
-    "raw_text", "normalized_text", "language", "category", "risk_score",
-    "confidence", "explanation", "red_flags", "keywords", "model", "extra",
-    "analyzed_at", "created_at", "updated_at",
-}
-SAFE_COLUMN_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,58}$")
-
-# ============================================================
-# ПРИЗНАКИ РИСКА (мультиязычные, эвристики для авто-повышения риска)
-# ============================================================
-RED_FLAG_PATTERNS = [
-    # финансовые пирамиды / доходность
-    r"гаранти(?:ру|ро)ванн(?:ый|ая|ое|ые)\s+(?:доход|прибыль|выплат)",
-    r"пассивн(?:ый|ая|ое|ые)\s+(?:доход|прибыль)",
-    r"приглашай\s+друзей", r"реферальн(?:ый|ая|ое|ые)\s+(?:программ|бонус)",
-    r"бонус\s+за\s+регистраци", r"удвоени[ею]\s+(?:депозит|вклад|сумм)",
-    r"без\s+риск[ао]", r"гарантия\s+возврат",
-    r"высок(?:ий|ая|ое|ие)\s+(?:доход|прибыль|процент)", r"доход\s+от\s+(\d+)\s*%",
-    r"вложи\s+и\s+получи", r"заработок\s+в\s+интернет", r"крипто(?:валютн|)\s+(?:пирамид|схем)",
-    r"mlm", r"сетевой\s+бизнес", r"пассивный\s+заработок", r"лёгкие\s+деньги",
-    r"быстрый\s+заработок", r"только\s+сегодня", r"спешите", r"успей",
-    r"акция\s+ограничена", r"инвестируй\s+сейчас", r"персональный\s+менеджер",
-    r"оффшор", r"нерезидент", r"без\s+проверк", r"скрытый\s+платеж",
-    r"комиссия\s+за\s+вывод", r"блокировка\s+счета",
-    r"кепілдік\s+табыс", r"пассивті\s+табыс", r"депозитті\s+екі\s+есеге\s+көбейту",
-    r"рефералдық\s+бағдарлама", r"тіркеу\s+бонусы", r"достарды\s+шақыру",
-    r"тәуекелсіз", r"жоғары\s+табыс", r"жылдам\s+табыс", r"оңай\s+ақша",
-    r"инвестиция\s+пирамидасы", r"қаржы\s+пирамидасы", r"заңсыз\s+қор", r"лицензиясыз",
-    # вакансии / вербовка (могут маскировать наркоторговлю)
-    r"работа\s+курьером\s+без\s+опыта", r"высокая\s+оплата\s+в\s+день",
-    r"требуется\s+курьер", r"работа\s+закладчиком", r"легкий\s+заработок\s+без\s+вложений",
-    # документы/лицензии
-    r"права\s+без\s+экзамена", r"диплом\s+без\s+учёбы", r"удостоверение\s+(?:личности\s+)?сделать",
-    r"изготовление\s+документов",
-    # общие мошеннические паттерны
-    r"схема", r"алаяқтық", r"scam", r"развод\s+на\s+деньги",
-]
-
-KZ_CITY_ALIASES = {
-    "астана": "Astana", "нур-султан": "Astana", "nur-sultan": "Astana",
-    "алматы": "Almaty", "шымкент": "Shymkent", "қарағанды": "Karaganda",
-    "караганда": "Karaganda", "ақтөбе": "Aktobe", "актобе": "Aktobe",
-    "атырау": "Atyrau", "ақтау": "Aktau", "актау": "Aktau",
-    "павлодар": "Pavlodar", "семей": "Semey", "өскемен": "Ust-Kamenogorsk",
-    "усть-каменогорск": "Ust-Kamenogorsk", "қостанай": "Kostanay",
-    "костанай": "Kostanay", "петропавл": "Petropavl", "көкшетау": "Kokshetau",
-    "кокшетау": "Kokshetau", "тараз": "Taraz", "түркістан": "Turkistan",
-    "туркестан": "Turkistan", "қызылорда": "Kyzylorda", "кызылорда": "Kyzylorda",
-    "талдықорған": "Taldykorgan", "талдыкорган": "Taldykorgan",
-    "oral": "Uralsk", "жетісай": "Zhetisay", "аркалық": "Arkalyk",
-    "екібастұз": "Ekibastuz", "rudny": "Rudny", "қонаев": "Konaev",
-    "сарыағаш": "Saryagash", "шардара": "Shardara", "жаңатас": "Zhanatas",
-    "қаратау": "Karatau", "балқаш": "Balkhash", "приозерск": "Priozersk",
-    "сатпаев": "Satpayev",
-}
+    return "UNKNOWN"
 
 # ============================================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -297,7 +215,7 @@ def parse_dt(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
     try:
-        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
         return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except (ValueError, TypeError):
         return None
@@ -334,7 +252,10 @@ def hash_value(value: str) -> str:
 def encrypt_value(value: str) -> Optional[str]:
     if not fernet:
         return None
-    return fernet.encrypt(value.encode("utf-8")).decode("utf-8")
+    try:
+        return fernet.encrypt(value.encode("utf-8")).decode("utf-8")
+    except Exception:
+        return None
 
 def decrypt_value(value: Optional[str]) -> Optional[str]:
     if not value or not fernet:
@@ -342,7 +263,6 @@ def decrypt_value(value: Optional[str]) -> Optional[str]:
     try:
         return fernet.decrypt(value.encode("utf-8")).decode("utf-8")
     except InvalidToken:
-        logger.error("Ошибка расшифровки: неверный ключ или повреждённые данные")
         return None
 
 def mask_value(entity_type: str, normalized: str) -> str:
@@ -362,8 +282,25 @@ def mask_value(entity_type: str, normalized: str) -> str:
     return normalized
 
 def infer_city(*texts: Optional[str]) -> Optional[str]:
+    kz_cities = {
+        "астана": "Astana", "нур-султан": "Astana", "nur-sultan": "Astana",
+        "алматы": "Almaty", "шымкент": "Shymkent", "қарағанды": "Karaganda",
+        "караганда": "Karaganda", "ақтөбе": "Aktobe", "актобе": "Aktobe",
+        "атырау": "Atyrau", "ақтау": "Aktau", "актау": "Aktau",
+        "павлодар": "Pavlodar", "семей": "Semey", "өскемен": "Ust-Kamenogorsk",
+        "усть-каменогорск": "Ust-Kamenogorsk", "қостанай": "Kostanay",
+        "костанай": "Kostanay", "петропавл": "Petropavl", "көкшетау": "Kokshetau",
+        "кокшетау": "Kokshetau", "тараз": "Taraz", "түркістан": "Turkistan",
+        "туркестан": "Turkistan", "қызылорда": "Kyzylorda", "кызылорда": "Kyzylorda",
+        "талдықорған": "Taldykorgan", "талдыкорган": "Taldykorgan",
+        "oral": "Uralsk", "жетісай": "Zhetisay", "аркалық": "Arkalyk",
+        "екібастұз": "Ekibastuz", "rudny": "Rudny", "қонаев": "Konaev",
+        "сарыағаш": "Saryagash", "шардара": "Shardara", "жаңатас": "Zhanatas",
+        "қаратау": "Karatau", "балқаш": "Balkhash", "приозерск": "Priozersk",
+        "сатпаев": "Satpayev",
+    }
     joined = " ".join(t for t in texts if t).lower()
-    for alias, canonical in KZ_CITY_ALIASES.items():
+    for alias, canonical in kz_cities.items():
         if alias in joined:
             return canonical
     return None
@@ -376,6 +313,52 @@ def severity_for(risk: float) -> str:
     if risk >= 0.5:
         return "MEDIUM"
     return "LOW"
+
+RED_FLAG_PATTERNS = [
+    r"гаранти(?:ру|ро)ванн(?:ый|ая|ое|ные)\s+(?:доход|прибыль|выплат)",
+    r"пассивн(?:ый|ая|ое|ые)\s+(?:доход|прибыль)",
+    r"приглашай\s+друзей",
+    r"реферальн(?:ый|ая|ое|ые)\s+(?:программ|бонус)",
+    r"бонус\s+за\s+регистраци",
+    r"удвоени[ею]\s+(?:депозит|вклад|сумм)",
+    r"без\s+риск[ао]",
+    r"гарантия\s+возврат",
+    r"высок(?:ий|ая|ое|ие)\s+(?:доход|прибыль|процент)",
+    r"доход\s+от\s+(\d+)\s*%",
+    r"вложи\s+и\s+получи",
+    r"заработок\s+в\s+интернет",
+    r"крипто(?:валютн|)\s+(?:пирамид|схем)",
+    r"mlm",
+    r"сетевой\s+бизнес",
+    r"пассивный\s+заработок",
+    r"лёгкие\s+деньги",
+    r"быстрый\s+заработок",
+    r"только\s+сегодня",
+    r"спешите",
+    r"успей",
+    r"акция\s+ограничена",
+    r"инвестируй\s+сейчас",
+    r"персональный\s+менеджер",
+    r"оффшор",
+    r"нерезидент",
+    r"без\s+проверк",
+    r"скрытый\s+платеж",
+    r"комиссия\s+за\s+вывод",
+    r"блокировка\s+счета",
+    r"кепілдік\s+табыс",
+    r"пассивті\s+табыс",
+    r"рефералдық\s+бағдарлама",
+    r"тіркеу\s+бонусы",
+    r"достарды\s+шақыру",
+    r"тәуекелсіз",
+    r"жоғары\s+табыс",
+    r"жылдам\s+табыс",
+    r"оңай\s+ақша",
+    r"инвестиция\s+пирамидасы",
+    r"қаржы\s+пирамидасы",
+    r"заңсыз\s+қор",
+    r"лицензиясыз",
+]
 
 def detect_red_flags(text: str) -> List[str]:
     if not text:
@@ -390,12 +373,12 @@ def detect_red_flags(text: str) -> List[str]:
     return list(set(flags))
 
 def compute_risk_boost(flags: List[str]) -> float:
-    count = len(flags)
-    if count == 0:
+    cnt = len(flags)
+    if cnt == 0:
         return 0.0
-    if count <= 2:
+    if cnt <= 2:
         return 0.1
-    if count <= 4:
+    if cnt <= 4:
         return 0.2
     return 0.3
 
@@ -419,11 +402,36 @@ def stable_item_id(*parts: Optional[str]) -> str:
     return hash_value(joined)[:24]
 
 # ============================================================
-# ДИНАМИЧЕСКОЕ ДОБАВЛЕНИЕ КОЛОНОК (для произвольных extra-полей)
+# ТИПЫ СУЩНОСТЕЙ, ИСТОЧНИКОВ, УЛИК (гибкие)
+# ============================================================
+ENTITY_TYPES = {
+    "CHANNEL", "ACCOUNT", "PERSON", "COMPANY", "PROJECT", "WEBSITE", "DOMAIN",
+    "PHONE", "EMAIL", "BANK_CARD", "IBAN", "WALLET", "USERNAME", "ADDRESS",
+    "TELEGRAM_BOT", "WHATSAPP_NUMBER", "SOCIAL_MEDIA", "CRYPTO_EXCHANGE", "OTHER",
+}
+
+SOURCE_TYPES = {
+    "YOUTUBE", "TELEGRAM", "TIKTOK", "INSTAGRAM", "THREADS", "WEBSITE",
+    "NEWS", "FORUM", "COMPLAINT", "MANUAL", "OTHER", "FACEBOOK", "VK", "ODNOKLASSNIKI",
+    "TWITTER", "X", "LINKEDIN", "SNAPCHAT", "DISCORD", "WHATSAPP", "VIBER",
+}
+
+EVIDENCE_TYPES = {"SCREENSHOT", "IMAGE", "VIDEO", "HTML", "PDF", "ARCHIVE", "AUDIO", "OTHER"}
+
+SENSITIVE_ENTITY_TYPES = {"PHONE", "EMAIL", "BANK_CARD", "IBAN", "WALLET", "ADDRESS"}
+
+RESERVED_POST_COLUMNS = {
+    "id", "source_id", "external_id", "url", "title", "author", "published_at",
+    "raw_text", "normalized_text", "language", "category", "risk_score",
+    "confidence", "explanation", "red_flags", "keywords", "model", "extra",
+    "analyzed_at", "created_at", "updated_at",
+}
+SAFE_COLUMN_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,58}$")
+
+# ============================================================
+# ДИНАМИЧЕСКИЕ КОЛОНКИ
 # ============================================================
 async def ensure_columns(conn: asyncpg.Connection, table_name: str, extra_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Гарантирует наличие TEXT-колонок для ключей extra_data. Возвращает
-    только те пары, которые безопасно использовать как имена колонок."""
     if not extra_data:
         return {}
     safe_data = {}
@@ -447,7 +455,7 @@ async def ensure_columns(conn: asyncpg.Connection, table_name: str, extra_data: 
             continue
         try:
             await conn.execute(f'ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS "{col}" TEXT')
-            logger.info(f"Добавлена колонка '{col}' (TEXT) в таблицу {table_name}")
+            logger.info(f"Добавлена колонка {col} (TEXT) в таблицу {table_name}")
         except Exception as e:
             logger.error(f"Не удалось добавить колонку {col}: {e}")
             safe_data.pop(col, None)
@@ -466,7 +474,6 @@ async def send_telegram_alert(
     evidence_urls: Optional[List[str]] = None,
 ) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.debug("Telegram не настроен (нет TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)")
         return
 
     cat_info = CATEGORY_CACHE.get(category, {})
@@ -508,7 +515,7 @@ async def send_telegram_alert(
             logger.exception("Ошибка отправки Telegram-уведомления")
 
 # ============================================================
-# PYDANTIC МОДЕЛИ (максимально терпимые к «кривым» данным парсеров)
+# PYDANTIC МОДЕЛИ
 # ============================================================
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="allow", str_strip_whitespace=True)
@@ -516,13 +523,13 @@ class StrictModel(BaseModel):
 class EntityInput(StrictModel):
     entity_type: str = "OTHER"
     value: str = Field(min_length=1, max_length=4000)
-    role: Optional[str] = Field(default=None, max_length=100)
-    confidence: float = Field(default=1.0, ge=0, le=1)
-    risk_score: Optional[float] = Field(default=None, ge=0, le=1)
+    role: Optional[str] = None
+    confidence: float = 1.0
+    risk_score: Optional[float] = None
     category: Optional[str] = None
     country: Optional[str] = None
     city: Optional[str] = None
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = {}
     excerpt: Optional[str] = None
 
     @field_validator("entity_type", mode="before")
@@ -533,11 +540,11 @@ class EntityInput(StrictModel):
 class RelationInput(StrictModel):
     source_ref: str
     target_ref: str
-    relation_type: str = Field(default="RELATED_TO", max_length=100)
-    confidence: float = Field(default=1.0, ge=0, le=1)
-    risk_score: float = Field(default=0.0, ge=0, le=1)
+    relation_type: str = "RELATED_TO"
+    confidence: float = 1.0
+    risk_score: float = 0.0
     description: Optional[str] = None
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = {}
 
 class EvidenceInput(StrictModel):
     evidence_type: str = "OTHER"
@@ -548,7 +555,7 @@ class EvidenceInput(StrictModel):
     captured_at: Optional[str] = None
     captured_by: Optional[str] = None
     entity_ref: Optional[str] = None
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = {}
 
     @field_validator("evidence_type", mode="before")
     @classmethod
@@ -565,8 +572,7 @@ class IngestRequest(StrictModel):
     source_url: Optional[str] = None
     source_city: Optional[str] = None
     source_country: str = "KZ"
-    source_meta: dict[str, Any] = Field(default_factory=dict)
-
+    source_meta: dict[str, Any] = {}
     item_id: Optional[str] = None
     item_url: Optional[str] = None
     title: Optional[str] = None
@@ -575,20 +581,18 @@ class IngestRequest(StrictModel):
     normalized_text: Optional[str] = None
     published_at: Optional[str] = None
     language: Optional[str] = None
-
     category: str = "UNKNOWN"
-    risk_score: float = Field(default=0.0, ge=0, le=1)
-    confidence: float = Field(default=0.0, ge=0, le=1)
+    risk_score: float = 0.0
+    confidence: float = 0.0
     explanation: Optional[str] = None
-    red_flags: list[str] = Field(default_factory=list)
-    keywords: list[str] = Field(default_factory=list)
-    tags: list[str] = Field(default_factory=list)
+    red_flags: list[str] = []
+    keywords: list[str] = []
+    tags: list[str] = []
     model: Optional[str] = None
-    extra: dict[str, Any] = Field(default_factory=dict)
-
-    entities: list[EntityInput] = Field(default_factory=list)
-    relations: list[RelationInput] = Field(default_factory=list)
-    evidence: list[EvidenceInput] = Field(default_factory=list)
+    extra: dict[str, Any] = {}
+    entities: list[EntityInput] = []
+    relations: list[RelationInput] = []
+    evidence: list[EvidenceInput] = []
 
     @field_validator("source_type", mode="before")
     @classmethod
@@ -614,7 +618,7 @@ class IngestRequest(StrictModel):
             self.item_id = stable_item_id(self.item_url, self.title, self.text, self.source_name)
         return self
 
-# ---- МОДЕЛИ ДЛЯ YOUTUBE HUNTER (совместимость со старым парсером) ----
+# ---- YouTube Hunter (совместимость) ----
 class ArrfrCheck(BaseModel):
     model_config = ConfigDict(extra="allow")
     is_blacklisted: bool = False
@@ -626,7 +630,7 @@ class ArrfrCheck(BaseModel):
 class DomainRisk(BaseModel):
     model_config = ConfigDict(extra="allow")
     risk: int = 0
-    flags: List[str] = Field(default_factory=list)
+    flags: List[str] = []
 
 class YouTubeAdResult(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -638,32 +642,46 @@ class YouTubeAdResult(BaseModel):
     screenshot_path: str = ""
     screenshot_url: Optional[str] = None
     transparency_url: str = ""
-    scraped_at: str = Field(default_factory=lambda: utcnow().isoformat())
+    scraped_at: str = None
     risk_score: int = 0
     verdict: str = "suspicious"
-    risk_flags: List[str] = Field(default_factory=list)
+    risk_flags: List[str] = []
     ai_reason: str = ""
     target_audience: str = ""
     scheme_type: str = ""
     license_check: str = ""
     advice_for_pensioner: str = ""
-    arrfr_check: ArrfrCheck = Field(default_factory=ArrfrCheck)
-    domain_risk: DomainRisk = Field(default_factory=DomainRisk)
+    arrfr_check: ArrfrCheck = ArrfrCheck()
+    domain_risk: DomainRisk = DomainRisk()
     analyzed_by: str = ""
     analyzed: bool = True
 
+    @field_validator("scraped_at", mode="before")
+    @classmethod
+    def default_scraped_at(cls, v: Any) -> str:
+        if not v:
+            return utcnow().isoformat()
+        return str(v)
+
 class YouTubeHunterPayload(BaseModel):
     model_config = ConfigDict(extra="allow")
-    run_timestamp: str = Field(default_factory=lambda: utcnow().isoformat())
+    run_timestamp: str = None
     project: str = "serpin-youtube"
     mode: str = "youtube_hunter"
-    summary: Dict[str, int] = Field(default_factory=dict)
-    ads: List[YouTubeAdResult] = Field(default_factory=list)
+    summary: Dict[str, int] = {}
+    ads: List[YouTubeAdResult] = []
+
+    @field_validator("run_timestamp", mode="before")
+    @classmethod
+    def default_timestamp(cls, v: Any) -> str:
+        if not v:
+            return utcnow().isoformat()
+        return str(v)
 
 class CategoryInput(BaseModel):
     code: str
     category_group: str = "OTHER"
-    name_ru: Optional[str] = None
+    name_ru: str
     name_kk: Optional[str] = None
     name_en: Optional[str] = None
     description_ru: Optional[str] = None
@@ -671,19 +689,24 @@ class CategoryInput(BaseModel):
     description_en: Optional[str] = None
     default_severity: str = "MEDIUM"
 
+class UploadScreenshotRequest(BaseModel):
+    file_name: str = "screenshot.png"
+    file_data: str
+    folder: str = "evidence"
+
 # ============================================================
 # МИГРАЦИИ / LIFESPAN
 # ============================================================
 async def run_migrations(db_pool: asyncpg.Pool) -> None:
     schema_path = os.path.join(os.path.dirname(__file__), "schema.sql")
     if not os.path.exists(schema_path):
-        logger.error("schema.sql не найден рядом с main.py — таблицы не созданы!")
+        logger.error("schema.sql не найден – таблицы не созданы")
         return
     with open(schema_path, "r", encoding="utf-8") as f:
         sql = f.read()
     async with db_pool.acquire() as conn:
         await conn.execute(sql)
-    logger.info("Миграции выполнены — все таблицы готовы")
+    logger.info("Миграции выполнены")
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -703,8 +726,8 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="SERPYN 2.0 — Анти-скам платформа",
-    version="2.0.0",
-    description="Универсальный бэкенд мониторинга мошенничества и нелегального контента в соцсетях Казахстана.",
+    version="2.0.1",
+    description="Универсальный бэкенд мониторинга мошенничества и нелегального контента",
     lifespan=lifespan,
 )
 
@@ -712,18 +735,18 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
     allow_credentials=CORS_ORIGINS != ["*"],
-    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "X-Ingest-Token", "X-Request-ID"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 def require_ingest_token(x_ingest_token: Optional[str] = Header(default=None)) -> None:
     if not INGEST_TOKEN:
-        raise HTTPException(503, "INGEST_TOKEN не настроен на сервере")
+        raise HTTPException(503, "INGEST_TOKEN не настроен")
     if not x_ingest_token or not secrets.compare_digest(x_ingest_token, INGEST_TOKEN):
         raise HTTPException(401, "Неверный или отсутствующий X-Ingest-Token")
 
 # ============================================================
-# UPSERT-ФУНКЦИИ
+# UPSERT ФУНКЦИИ
 # ============================================================
 async def upsert_project(conn: asyncpg.Connection, name: str) -> int:
     name = (name or "SERPYN").strip() or "SERPYN"
@@ -737,10 +760,9 @@ async def upsert_source(conn: asyncpg.Connection, project_id: int, ev: IngestReq
     city = ev.source_city or infer_city(ev.source_name, ev.source_url, ev.text)
     return await conn.fetchval(
         """
-        INSERT INTO sources(
-            project_id, source_type, name, external_id, username, url,
-            platform_meta, city, country, last_seen, risk_score, category
-        ) VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,now(),$10,$11)
+        INSERT INTO sources(project_id, source_type, name, external_id, username, url,
+            platform_meta, city, country, last_seen, risk_score, category)
+        VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,now(),$10,$11)
         ON CONFLICT(source_type, external_id) DO UPDATE SET
             project_id = EXCLUDED.project_id,
             name = EXCLUDED.name,
@@ -761,7 +783,10 @@ async def upsert_source(conn: asyncpg.Connection, project_id: int, ev: IngestReq
 
 async def upsert_post(conn: asyncpg.Connection, source_id: int, ev: IngestRequest) -> int:
     if not ev.language and ev.text:
-        ev.language = "ru" if any(0x0400 < ord(ch) < 0x0500 for ch in ev.text) else "en"
+        if any(0x0400 < ord(ch) < 0x0500 for ch in ev.text):
+            ev.language = "ru"
+        else:
+            ev.language = "en"
 
     extra_serialized: Dict[str, str] = {}
     for key, val in (ev.extra or {}).items():
@@ -769,7 +794,7 @@ async def upsert_post(conn: asyncpg.Connection, source_id: int, ev: IngestReques
 
     safe_extra = await ensure_columns(conn, "posts", extra_serialized)
 
-    insert_data: Dict[str, Any] = {
+    insert_data = {
         "source_id": source_id,
         "external_id": ev.item_id,
         "url": ev.item_url,
@@ -794,7 +819,6 @@ async def upsert_post(conn: asyncpg.Connection, source_id: int, ev: IngestReques
     columns = list(insert_data.keys())
     placeholders = [f"${i + 1}" for i in range(len(columns))]
     update_clause = ", ".join(f"{col} = EXCLUDED.{col}" for col in columns if col not in {"source_id", "external_id"})
-
     query = f"""
         INSERT INTO posts ({", ".join(columns)})
         VALUES ({", ".join(placeholders)})
@@ -812,15 +836,14 @@ async def upsert_entity(conn: asyncpg.Connection, entity: EntityInput, fallback_
     encrypted = encrypt_value(entity.value) if sensitive else None
     display = mask_value(entity.entity_type, normalized) if sensitive else entity.value.strip()
     city = entity.city or infer_city(entity.value, safe_json(entity.metadata))
-    category = normalize_category(entity.category) if entity.category else fallback_category
+    category = normalize_category(entity.category) or fallback_category
     risk = entity.risk_score if entity.risk_score is not None else fallback_risk
 
     return await conn.fetchval(
         """
-        INSERT INTO entities(
-            entity_type, display_value, normalized_value, value_hash, encrypted_value,
-            risk_score, category, country, city, metadata, last_seen
-        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,now())
+        INSERT INTO entities(entity_type, display_value, normalized_value, value_hash, encrypted_value,
+            risk_score, category, country, city, metadata, last_seen)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,now())
         ON CONFLICT(entity_type, value_hash) DO UPDATE SET
             display_value = EXCLUDED.display_value,
             encrypted_value = COALESCE(EXCLUDED.encrypted_value, entities.encrypted_value),
@@ -851,12 +874,12 @@ async def upsert_tags(conn: asyncpg.Connection, post_id: int, tag_names: List[st
         )
 
 # ============================================================
-# ОСНОВНАЯ ФУНКЦИЯ СОХРАНЕНИЯ
+# ОСНОВНАЯ ЛОГИКА СОХРАНЕНИЯ
 # ============================================================
 async def save_ingest(ev: IngestRequest) -> dict:
     assert pool is not None
     payload_hash = hash_value(ev.model_dump_json())
-    entity_ids: dict[str, int] = {}
+    entity_ids: Dict[str, int] = {}
 
     await ensure_category_exists(ev.category)
 
@@ -913,10 +936,9 @@ async def save_ingest(ev: IngestRequest) -> dict:
                         continue
                     await conn.execute(
                         """
-                        INSERT INTO relations(
-                            source_entity_id, target_entity_id, relation_type,
-                            confidence, risk_score, evidence_post_id, description, metadata, last_seen
-                        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,now())
+                        INSERT INTO relations(source_entity_id, target_entity_id, relation_type,
+                            confidence, risk_score, evidence_post_id, description, metadata, last_seen)
+                        VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,now())
                         ON CONFLICT(source_entity_id, target_entity_id, relation_type, evidence_post_id)
                         DO UPDATE SET
                             confidence = GREATEST(relations.confidence, EXCLUDED.confidence),
@@ -934,10 +956,9 @@ async def save_ingest(ev: IngestRequest) -> dict:
                     entity_id = entity_ids.get(evd.entity_ref) if evd.entity_ref else None
                     await conn.execute(
                         """
-                        INSERT INTO evidence(
-                            post_id, entity_id, evidence_type, storage_url, original_url,
-                            sha256, mime_type, captured_at, captured_by, metadata
-                        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)
+                        INSERT INTO evidence(post_id, entity_id, evidence_type, storage_url, original_url,
+                            sha256, mime_type, captured_at, captured_by, metadata)
+                        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)
                         """,
                         post_id, entity_id, evd.evidence_type, evd.storage_url,
                         evd.original_url, evd.sha256, evd.mime_type,
@@ -963,7 +984,6 @@ async def save_ingest(ev: IngestRequest) -> dict:
                     ev.request_id, ev.source_type, payload_hash,
                 )
 
-        # Telegram уходит по каждой новой находке (кроме CLEAN), см. ALERT_MIN_RISK
         if ev.category != "CLEAN" and ev.risk_score >= ALERT_MIN_RISK:
             evidence_urls = [e.storage_url for e in ev.evidence if e.storage_url]
             await send_telegram_alert(
@@ -988,7 +1008,6 @@ async def save_ingest(ev: IngestRequest) -> dict:
             "evidence_saved": len(ev.evidence),
             "tags_saved": len(ev.tags),
             "risk_adjusted": risk_boost > 0,
-            "detected_red_flags": all_flags,
         }
     except HTTPException:
         raise
@@ -1001,29 +1020,26 @@ async def save_ingest(ev: IngestRequest) -> dict:
                     ev.request_id, ev.source_type, payload_hash, str(e)[:2000],
                 )
         except Exception:
-            logger.exception("Не удалось записать ошибку ингеста в журнал")
-        # Никогда не роняем сервер целиком — но сообщаем клиенту о неудаче
-        raise HTTPException(500, detail=f"Ошибка сохранения данных: {e}")
+            pass
+        raise HTTPException(500, detail=f"Ошибка сохранения данных: {str(e)[:500]}")
 
 # ============================================================
-# ЭНДПОИНТЫ — СЛУЖЕБНЫЕ
+# ЭНДПОИНТЫ
 # ============================================================
 @app.get("/health")
 async def health() -> dict:
     try:
-        assert pool is not None
         async with pool.acquire() as conn:
             await conn.fetchval("SELECT 1")
-        return {"status": "ok", "service": "SERPYN", "database": "ok", "time": utcnow().isoformat()}
+        return {"status": "ok", "database": "ok", "time": utcnow().isoformat()}
     except Exception as e:
-        logger.exception("Health check failed")
-        return {"status": "degraded", "service": "SERPYN", "database": "error", "error": str(e)}
+        return {"status": "degraded", "database": "error", "error": str(e)}
 
 @app.get("/")
 async def root() -> dict:
     return {
-        "service": "SERPYN 2.0 — Анти-скам платформа",
-        "version": "2.0.0",
+        "service": "SERPYN 2.0 – Анти-скам платформа",
+        "version": "2.0.1",
         "docs": "/docs",
         "health": "/health",
         "endpoints": {
@@ -1039,9 +1055,6 @@ async def root() -> dict:
         },
     }
 
-# ============================================================
-# ЭНДПОИНТЫ — ПРИЁМ ДАННЫХ
-# ============================================================
 @app.post("/ingest")
 async def ingest(ev: IngestRequest, request: Request) -> dict:
     require_ingest_token(request.headers.get("X-Ingest-Token"))
@@ -1153,16 +1166,11 @@ async def ingest_youtube(payload: YouTubeHunterPayload, request: Request) -> dic
 
     return {"status": "success", "saved": saved, "failed": failed, "total": len(payload.ads)}
 
-class UploadScreenshotRequest(BaseModel):
-    file_name: str = "screenshot.png"
-    file_data: str  # data:image/png;base64,... либо чистый base64
-    folder: str = "evidence"
-
 @app.post("/upload_screenshot")
 async def upload_screenshot(req: UploadScreenshotRequest, request: Request) -> dict:
     require_ingest_token(request.headers.get("X-Ingest-Token"))
     if not supabase_client:
-        raise HTTPException(503, "Supabase Storage не настроен на сервере (SUPABASE_URL / SUPABASE_SERVICE_KEY)")
+        raise HTTPException(503, "Supabase Storage не настроен на сервере")
 
     try:
         raw = req.file_data.split(",", 1)[1] if req.file_data.startswith("data:") else req.file_data
@@ -1218,7 +1226,7 @@ async def add_evidence(
         evidence_id = await conn.fetchval(
             """
             INSERT INTO evidence(post_id, entity_id, evidence_type, storage_url, original_url,
-                                  sha256, mime_type, captured_at, captured_by)
+                sha256, mime_type, captured_at, captured_by)
             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id
             """,
             post_id, entity_id, normalize_evidence_type(evidence_type), storage_url, original_url,
@@ -1226,20 +1234,11 @@ async def add_evidence(
         )
     return {"status": "success", "evidence_id": evidence_id}
 
-# ============================================================
-# ЭНДПОИНТЫ — ДИНАМИЧЕСКИЕ КАТЕГОРИИ И ТЕГИ
-# ============================================================
 @app.get("/categories")
-async def list_categories(group: Optional[str] = None) -> list[dict]:
+async def list_categories() -> list[dict]:
     assert pool is not None
     async with pool.acquire() as conn:
-        if group:
-            rows = await conn.fetch(
-                "SELECT * FROM categories WHERE is_active = true AND category_group = $1 ORDER BY code",
-                group.upper(),
-            )
-        else:
-            rows = await conn.fetch("SELECT * FROM categories WHERE is_active = true ORDER BY category_group, code")
+        rows = await conn.fetch("SELECT * FROM categories WHERE is_active = true ORDER BY category_group, code")
         return [dict(r) for r in rows]
 
 @app.post("/categories")
@@ -1253,7 +1252,7 @@ async def create_category(cat: CategoryInput, request: Request) -> dict:
         row = await conn.fetchrow(
             """
             INSERT INTO categories(code, category_group, name_ru, name_kk, name_en,
-                                    description_ru, description_kk, description_en, default_severity)
+                description_ru, description_kk, description_en, default_severity)
             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
             ON CONFLICT(code) DO UPDATE SET
                 category_group = EXCLUDED.category_group,
@@ -1271,7 +1270,7 @@ async def create_category(cat: CategoryInput, request: Request) -> dict:
             code, cat.category_group.upper(), cat.name_ru, cat.name_kk, cat.name_en,
             cat.description_ru, cat.description_kk, cat.description_en, cat.default_severity.upper(),
         )
-    CATEGORY_CACHE[code] = dict(row)
+    await reload_category_cache()
     return {"status": "success", "category": dict(row)}
 
 @app.get("/tags")
@@ -1289,7 +1288,7 @@ async def list_tags(limit: int = Query(200, ge=1, le=2000)) -> list[dict]:
         return [dict(r) for r in rows]
 
 # ============================================================
-# ЭНДПОИНТЫ — ЧТЕНИЕ ДАННЫХ
+# ЭНДПОИНТЫ ЧТЕНИЯ ДАННЫХ
 # ============================================================
 @app.get("/wallets")
 async def list_wallets(min_risk: float = Query(0.0, ge=0, le=1), limit: int = Query(50, ge=1, le=500)) -> list[dict]:
