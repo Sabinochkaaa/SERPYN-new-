@@ -295,3 +295,15 @@ ON CONFLICT (code) DO NOTHING;
 INSERT INTO categories (code, category_group, name_ru, name_kk, name_en, default_severity)
 VALUES ('OTHER', 'OTHER', 'Другое', 'Басқа', 'Other', 'LOW')
 ON CONFLICT (code) DO NOTHING;
+-- Добавляем недостающие категории (если их ещё нет)
+INSERT INTO categories (code, category_group, name_ru, name_kk, name_en, default_severity) VALUES
+('FOREX_SCAM', 'FINANCE', 'Форекс / бинарные опционы', 'Форекс / бинарлық опциондар', 'Forex / binary options', 'HIGH'),
+('FAKE_STATE', 'SCAM', 'Фейк гос. выплаты', 'Жалған мемлекеттік төлемдер', 'Fake state payments', 'HIGH'),
+('INVESTMENT_OFFER', 'FINANCE', 'Инвестиционное предложение', 'Инвестициялық ұсыныс', 'Investment offer', 'MEDIUM'),
+('ILLEGAL_SERVICES', 'ILLEGAL', 'Нелегальные услуги', 'Заңсыз қызметтер', 'Illegal services', 'HIGH'),
+('FAKE_DOCS', 'ILLEGAL', 'Подделка документов', 'Құжаттарды жалғандау', 'Fake documents', 'CRITICAL'),
+('BLACKMAIL', 'ILLEGAL', 'Вымогательство', 'Бопсалау', 'Blackmail / extortion', 'CRITICAL'),
+('JOB_SCAM', 'SCAM', 'Фейк вакансия', 'Жалған жұмыс', 'Fake job', 'HIGH'),
+('ROMANCE_SCAM', 'SCAM', 'Романтический скам', 'Романтикалық алаяқтық', 'Romance scam', 'HIGH'),
+('GENERAL_SCAM', 'SCAM', 'Общий скам', 'Жалпы алаяқтық', 'General scam', 'MEDIUM')
+ON CONFLICT (code) DO NOTHING;
