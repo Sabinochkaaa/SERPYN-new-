@@ -1056,7 +1056,7 @@ async def save_ingest(ev: IngestRequest) -> dict:
                 risk_score=ev.risk_score,
                 source_name=ev.source_name,
                 source_type=ev.source_type,
-                post_url=ev.item_url,
+                post_url=ev.item_url or ev.source_url,
                 evidence_urls=evidence_urls,
             )
 
