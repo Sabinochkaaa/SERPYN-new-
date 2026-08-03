@@ -1072,6 +1072,54 @@ async def add_evidence(
         )
     return {"status": "success", "evidence_id": evidence_id}
 
+from pydantic import BaseModel
+import base64
+import uuid
+
+class UploadScreenshotRequest(BaseModel):
+    file_name: str
+    file_data: str  # data:image/png;base64,...
+    folder: str = "screenshots"
+
+# Инициализация Supabase клиента на сервере (с service_role ключом)
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "").strip()
+
+supabase_client = None
+if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+    try:
+        from supabase import create_client
+        supabase_client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    except Exception as e:
+        logger.error(f"Supabase init error: {e}")
+
+@app.post("/upload_screenshot")
+async def upload_screenshot(req: UploadScreenshotRequest, request: Request):
+    require_ingest_token(request.headers.get("X-Ingest-Token"))
+    if not supabase_client:
+        raise HTTPException(503, "Supabase не настроен на сервере")
+
+    # Извлекаем base64
+    if req.file_data.startswith("data:"):
+        b64 = req.file_data.split(",", 1)[1]
+    else:
+        b64 = req.file_data
+    file_bytes = base64.b64decode(b64)
+
+    # Генерируем уникальное имя
+    ext = req.file_name.split(".")[-1] if "." in req.file_name else "png"
+    unique_name = f"{uuid.uuid4()}.{ext}"
+
+    # Загружаем в бакет
+    res = supabase_client.storage.from_(req.folder).upload(
+        unique_name, file_bytes, {"content-type": "image/png"}
+    )
+    if res.status_code != 200:
+        raise HTTPException(500, f"Ошибка загрузки: {res.text}")
+
+    public_url = supabase_client.storage.from_(req.folder).get_public_url(unique_name)
+    return {"url": public_url}
+
 # ---------- ОСТАЛЬНЫЕ ЭНДПОИНТЫ (чтение данных) ----------
 @app.get("/wallets")
 async def list_wallets(
