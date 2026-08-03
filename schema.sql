@@ -122,30 +122,43 @@ CREATE TABLE IF NOT EXISTS evidence (
     created_at TIMESTAMPTZ DEFAULT now()
 );
 
--- Статьи УК РК
-CREATE TABLE IF NOT EXISTS legal_articles (
+-- Динамические категории (вместо жёсткого списка)
+CREATE TABLE IF NOT EXISTS categories (
     id BIGSERIAL PRIMARY KEY,
-    code TEXT NOT NULL,
-    article_number TEXT NOT NULL,
-    title TEXT NOT NULL,
+    name TEXT NOT NULL,                -- внутреннее имя (например, 'PYRAMID')
+    label_ru TEXT NOT NULL,            -- отображаемое название на русском
+    label_kk TEXT,                     -- на казахском
+    label_en TEXT,                     -- на английском
     description TEXT,
-    categories TEXT[] NOT NULL,
-    max_penalty TEXT,
-    adilet_url TEXT,
-    created_at TIMESTAMPTZ DEFAULT now(),
-    UNIQUE(code, article_number)
+    risk_default REAL DEFAULT 0.5,
+    is_illegal BOOLEAN DEFAULT false,
+    icon TEXT,
+    color TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
 );
 
--- Связь постов со статьями
-CREATE TABLE IF NOT EXISTS post_legal_articles (
+CREATE UNIQUE INDEX idx_categories_name ON categories(name);
+
+-- Теги для гибкой классификации
+CREATE TABLE IF NOT EXISTS tags (
     id BIGSERIAL PRIMARY KEY,
-    post_id BIGINT NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
-    legal_article_id BIGINT NOT NULL REFERENCES legal_articles(id) ON DELETE CASCADE,
-    created_at TIMESTAMPTZ DEFAULT now(),
-    UNIQUE(post_id, legal_article_id)
+    name TEXT NOT NULL UNIQUE,
+    label_ru TEXT NOT NULL,
+    label_kk TEXT,
+    label_en TEXT,
+    color TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
 );
 
--- Таблица алертов
+-- Связь постов с тегами
+CREATE TABLE IF NOT EXISTS post_tags (
+    post_id BIGINT NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    tag_id BIGINT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    PRIMARY KEY (post_id, tag_id)
+);
+
+-- Таблица алертов (без привязки к статье)
 CREATE TABLE IF NOT EXISTS alerts (
     id BIGSERIAL PRIMARY KEY,
     project_id BIGINT REFERENCES projects(id) ON DELETE CASCADE,
@@ -173,7 +186,7 @@ CREATE TABLE IF NOT EXISTS ingest_events (
     created_at TIMESTAMPTZ DEFAULT now()
 );
 
--- Индексы
+-- Индексы (без legal_articles)
 CREATE INDEX IF NOT EXISTS idx_sources_project ON sources(project_id);
 CREATE INDEX IF NOT EXISTS idx_sources_type ON sources(source_type);
 CREATE INDEX IF NOT EXISTS idx_sources_last_seen ON sources(last_seen);
@@ -190,13 +203,43 @@ CREATE INDEX IF NOT EXISTS idx_evidence_post ON evidence(post_id);
 CREATE INDEX IF NOT EXISTS idx_evidence_entity ON evidence(entity_id);
 CREATE INDEX IF NOT EXISTS idx_alerts_read ON alerts(is_read) WHERE is_read = false;
 CREATE INDEX IF NOT EXISTS idx_alerts_risk ON alerts(risk_score DESC);
-CREATE INDEX IF NOT EXISTS idx_legal_categories ON legal_articles USING GIN(categories);
 
--- Вставка реальных статей УК РК
-INSERT INTO legal_articles (code, article_number, title, description, categories, max_penalty, adilet_url) VALUES
-('УК', '217', 'Создание и руководство финансовой пирамидой', 'Создание и (или) руководство финансовой пирамидой, а равно участие в ней', ARRAY['PYRAMID', 'LIKELY_PYRAMID', 'HIGH_RISK_PYRAMID'], 'до 7 лет лишения свободы', 'https://adilet.zan.kz/rus/docs/K1400000226#z2016'),
-('УК', '190', 'Мошенничество', 'Хищение чужого имущества или приобретение права на чужое имущество путём обмана или злоупотребления доверием', ARRAY['INVESTMENT_SCAM', 'FINANCIAL_FRAUD', 'FAKE_BROKER'], 'до 10 лет лишения свободы', 'https://adilet.zan.kz/rus/docs/K1400000226#z1779'),
-('УК', '218', 'Лжепредпринимательство', 'Создание юридического лица без намерения осуществлять предпринимательскую деятельность с целью извлечения доходов', ARRAY['UNREGISTERED_FUND', 'UNLICENSED_FINANCE'], 'до 5 лет лишения свободы', 'https://adilet.zan.kz/rus/docs/K1400000226#z2025'),
-('УК', '297', 'Незаконный оборот наркотических средств', 'Незаконные изготовление, переработка, приобретение, хранение, перевозка или сбыт наркотических средств', ARRAY['DRUG'], 'до 15 лет лишения свободы', 'https://adilet.zan.kz/rus/docs/K1400000226#z2883'),
-('УК', '298', 'Склонение к потреблению наркотических средств', 'Склонение к потреблению наркотических средств, психотропных веществ или их аналогов', ARRAY['DRUG'], 'до 7 лет лишения свободы', 'https://adilet.zan.kz/rus/docs/K1400000226#z2897')
-ON CONFLICT (code, article_number) DO NOTHING;
+-- Начальные категории (на русском, казахском, английском)
+INSERT INTO categories (name, label_ru, label_kk, label_en, risk_default, is_illegal, icon, color) VALUES
+('PYRAMID', 'Финансовая пирамида', 'Қаржы пирамидасы', 'Financial pyramid', 0.9, false, '🔺', '#ef476f'),
+('PONZI', 'Схема Понци', 'Понци схемасы', 'Ponzi scheme', 0.9, false, '🔄', '#ef476f'),
+('MLM_SCAM', 'Сетевой маркетинг (скам)', 'Желілік маркетинг (алаяқтық)', 'MLM scam', 0.7, false, '🔗', '#ff9b52'),
+('CRYPTO_SCAM', 'Крипто-мошенничество', 'Крипто-алаяқтық', 'Crypto scam', 0.85, false, '₿', '#8d63ff'),
+('INVESTMENT_SCAM', 'Инвестиционное мошенничество', 'Инвестициялық алаяқтық', 'Investment scam', 0.85, false, '💰', '#ff5ea8'),
+('FAKE_BROKER', 'Фальшивый брокер', 'Жалған брокер', 'Fake broker', 0.8, false, '📈', '#ff9b52'),
+('UNLICENSED_FINANCE', 'Нелегальная финансовая деятельность', 'Заңсыз қаржылық қызмет', 'Unlicensed finance', 0.8, false, '🏦', '#32c7dc'),
+('HIGH_YIELD', 'Обещание высокой доходности', 'Жоғары табыс уәдесі', 'High yield promise', 0.75, false, '📊', '#32c7dc'),
+('REFERRAL_SCHEME', 'Реферальная схема', 'Рефералдық схема', 'Referral scheme', 0.7, false, '👥', '#8d63ff'),
+('FAKE_INVESTMENT', 'Фейк инвестиции', 'Жалған инвестиция', 'Fake investment', 0.85, false, '💸', '#ef476f'),
+('PHISHING', 'Фишинг', 'Фишинг', 'Phishing', 0.9, false, '🎣', '#ff9b52'),
+('FAKE_SHOP', 'Фейк магазин', 'Жалған дүкен', 'Fake shop', 0.8, false, '🛒', '#ff9b52'),
+('FAKE_JOB', 'Фейк вакансия', 'Жалған жұмыс', 'Fake job', 0.8, false, '💼', '#ff9b52'),
+('ROMANCE_SCAM', 'Романтический скам', 'Романтикалық алаяқтық', 'Romance scam', 0.85, false, '💔', '#ff5ea8'),
+('GAMBLING', 'Азартные игры / казино', 'Құмар ойындар / казино', 'Gambling / casino', 0.7, false, '🎰', '#32c7dc'),
+('DRUGS', 'Наркотики', 'Есірткі', 'Drugs', 1.0, true, '💊', '#c0002a'),
+('WEAPONS', 'Оружие', 'Қару', 'Weapons', 1.0, true, '🔫', '#c0002a'),
+('FORGERY', 'Подделка документов', 'Құжаттарды жалғандау', 'Forgery', 1.0, true, '📄', '#c0002a'),
+('COUNTERFEIT', 'Контрафакт', 'Контрафакт', 'Counterfeit', 0.9, true, '📦', '#c0002a'),
+('ILLEGAL_SERVICES', 'Нелегальные услуги', 'Заңсыз қызметтер', 'Illegal services', 0.9, true, '🚫', '#c0002a'),
+('EXTORTION', 'Вымогательство', 'Бопсалау', 'Extortion', 1.0, true, '😡', '#c0002a'),
+('OTHER_SCAM', 'Другой скам', 'Басқа алаяқтық', 'Other scam', 0.7, false, '⚠️', '#6f7c91'),
+('SUSPICIOUS_JOB', 'Подозрительная работа', 'Күдікті жұмыс', 'Suspicious job', 0.7, false, '🔍', '#8d63ff'),
+('CLEAN', 'Безопасно', 'Қауіпсіз', 'Clean', 0.0, false, '✅', '#31c48d'),
+('UNKNOWN', 'Неизвестно', 'Белгісіз', 'Unknown', 0.0, false, '❓', '#6f7c91')
+ON CONFLICT (name) DO NOTHING;
+
+-- Начальные теги (пример)
+INSERT INTO tags (name, label_ru, label_kk, label_en) VALUES
+('guaranteed_return', 'Гарантированный возврат', 'Кепілді қайтару', 'Guaranteed return'),
+('passive_income', 'Пассивный доход', 'Пассивті табыс', 'Passive income'),
+('referral_bonus', 'Реферальный бонус', 'Рефералдық бонус', 'Referral bonus'),
+('no_license', 'Без лицензии', 'Лицензиясыз', 'No license'),
+('pressure_tactics', 'Давление', 'Қысым', 'Pressure tactics'),
+('crypto_payment', 'Крипто-платёж', 'Крипто-төлем', 'Crypto payment'),
+('fake_state_benefit', 'Фейк гос. выплата', 'Жалған мемлекеттік төлем', 'Fake state benefit')
+ON CONFLICT (name) DO NOTHING;
