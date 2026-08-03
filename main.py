@@ -99,9 +99,20 @@ async def ensure_category_exists(code: str) -> None:
         return
     assert pool is not None
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM categories WHERE code = $1 AND is_active = true", code)
-    if row:
-        CATEGORY_CACHE[code] = dict(row)
+        row = await conn.fetchrow("SELECT * FROM categories WHERE code = $1", code)
+        if row:
+            CATEGORY_CACHE[code] = dict(row)
+            return
+        # Если категории нет – создаём её
+        await conn.execute(
+            """
+            INSERT INTO categories(code, category_group, name_ru, name_kk, name_en, default_severity)
+            VALUES($1, $2, $3, $4, $5, $6)
+            """,
+            code, 'OTHER', code, code, code, 'MEDIUM'
+        )
+        await reload_category_cache()
+        logger.info(f"Автоматически создана новая категория: {code}")
 
 # ============================================================
 # СИНОНИМЫ КАТЕГОРИЙ (расширенный список)
