@@ -99,20 +99,9 @@ async def ensure_category_exists(code: str) -> None:
         return
     assert pool is not None
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM categories WHERE code = $1", code)
-        if row:
-            CATEGORY_CACHE[code] = dict(row)
-            return
-        # Если категории нет – создаём её
-        await conn.execute(
-            """
-            INSERT INTO categories(code, category_group, name_ru, name_kk, name_en, default_severity)
-            VALUES($1, $2, $3, $4, $5, $6)
-            """,
-            code, 'OTHER', code, code, code, 'MEDIUM'
-        )
-        await reload_category_cache()
-        logger.info(f"Автоматически создана новая категория: {code}")
+        row = await conn.fetchrow("SELECT * FROM categories WHERE code = $1 AND is_active = true", code)
+    if row:
+        CATEGORY_CACHE[code] = dict(row)
 
 # ============================================================
 # СИНОНИМЫ КАТЕГОРИЙ (расширенный список)
@@ -506,13 +495,7 @@ async def ensure_columns(conn: asyncpg.Connection, table_name: str, extra_data: 
             logger.error(f"Не удалось добавить колонку {col}: {e}")
             safe_data.pop(col, None)
     return safe_data
-    
-def escape_markdown(text: str) -> str:
-    """Экранирует специальные символы для Markdown (Telegram)."""
-    chars = r'_*[]()~`>#+-=|{}.!@'
-    for ch in chars:
-        text = text.replace(ch, '\\' + ch)
-    return text
+
 # ============================================================
 # TELEGRAM УВЕДОМЛЕНИЯ
 # ============================================================
@@ -531,20 +514,13 @@ async def send_telegram_alert(
     cat_info = CATEGORY_CACHE.get(category, {})
     cat_label = cat_info.get("name_ru") or category
 
-    # Экранируем все поля, которые попадают в текст
-    source_name_esc = escape_markdown(source_name)
-    cat_label_esc = escape_markdown(cat_label)
-    title_esc = escape_markdown((title or '')[:200])
-    source_type_esc = escape_markdown(source_type or '—')
-
     message = (
         f"🚨 *Новое обнаружение — SERPYN*\n"
-        f"📌 *Источник:* {source_name_esc} ({source_type_esc})\n"
-        f"📂 *Категория:* `{category}` — {cat_label_esc}\n"
+        f"📌 *Источник:* {source_name} ({source_type or '—'})\n"
+        f"📂 *Категория:* `{category}` — {cat_label}\n"
         f"📊 *Риск:* {risk_score:.2f} ({severity_for(risk_score)})\n"
-        f"📝 *Тема:* {title_esc}\n"
+        f"📝 *Тема:* {(title or '')[:200]}\n"
     )
-
     if post_url:
         message += f"\n🔗 [Открыть пост]({post_url})"
 
@@ -554,26 +530,41 @@ async def send_telegram_alert(
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
-            payload = {
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message,
-                "parse_mode": "Markdown",
-                "disable_web_page_preview": True,
-            }
-            if reply_markup:
-                payload["reply_markup"] = reply_markup
-            await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json=payload)
-
+            # Если есть скриншоты — отправляем ПЕРВОЕ фото с полным текстом в caption
             if evidence_urls:
-                for url in evidence_urls[:10]:
+                first_url = evidence_urls[0]
+                await client.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+                    json={
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "photo": first_url,
+                        "caption": message,
+                        "parse_mode": "Markdown",
+                        "reply_markup": reply_markup,
+                    },
+                )
+                # Остальные фото (если есть) отправляем без подписи или с краткой
+                for url in evidence_urls[1:10]:
                     await client.post(
                         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
                         json={
                             "chat_id": TELEGRAM_CHAT_ID,
                             "photo": url,
-                            "caption": f"📸 {title_esc[:60]}",
+                            "caption": "📸 Дополнительный скриншот",
                         },
                     )
+            else:
+                # Если скриншотов нет — отправляем только текст
+                payload = {
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": message,
+                    "parse_mode": "Markdown",
+                    "disable_web_page_preview": True,
+                }
+                if reply_markup:
+                    payload["reply_markup"] = reply_markup
+                await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json=payload)
+
             logger.info("Telegram-уведомление отправлено")
         except Exception:
             logger.exception("Ошибка отправки Telegram-уведомления")
@@ -1056,7 +1047,7 @@ async def save_ingest(ev: IngestRequest) -> dict:
                 risk_score=ev.risk_score,
                 source_name=ev.source_name,
                 source_type=ev.source_type,
-                post_url=ev.item_url or ev.source_url,
+                post_url=ev.item_url,
                 evidence_urls=evidence_urls,
             )
 
