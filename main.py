@@ -185,6 +185,18 @@ CATEGORY_ALIASES: Dict[str, str] = {
     "подозрительно": "SUSPICIOUS", "күдікті": "SUSPICIOUS", "suspicious": "SUSPICIOUS",
     "скам": "OTHER_SCAM", "мошенничество": "OTHER_SCAM", "алаяқтық": "OTHER_SCAM",
     "scam": "OTHER_SCAM",
+    "форекс": "FOREX_SCAM",
+"бинарки": "FOREX_SCAM",
+"forex": "FOREX_SCAM",
+"гос выплата": "FAKE_STATE",
+"государственная выплата": "FAKE_STATE",
+"fake state": "FAKE_STATE",
+"фейк займ": "FAKE_LOAN",
+"fake loan": "FAKE_LOAN",
+"пенсионная схема": "PENSION_SCAM",
+"pension scam": "PENSION_SCAM",
+"общий скам": "GENERAL_SCAM",
+"general scam": "GENERAL_SCAM",
 }
 
 def normalize_category(value: Optional[str]) -> str:
