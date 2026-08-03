@@ -197,6 +197,29 @@ CATEGORY_ALIASES: Dict[str, str] = {
 "pension scam": "PENSION_SCAM",
 "общий скам": "GENERAL_SCAM",
 "general scam": "GENERAL_SCAM",
+    # Прямые соответствия для парсера
+    "pyramid": "PYRAMID",
+    "investment_fraud": "INVESTMENT_FRAUD",  # у вас нет такой категории, можно заменить на INVESTMENT_OFFER или INVESTMENT_SCAM
+    "mlm": "MLM_SCAM",
+    "crypto_scam": "CRYPTO_SCAM",
+    "forex_scam": "FOREX_SCAM",
+    "fake_state": "FAKE_STATE",
+    "fake_loan": "INVESTMENT_OFFER",
+    "drugs": "DRUGS",
+    "weapons": "WEAPONS",
+    "illegal_services": "ILLEGAL_SERVICES",
+    "fake_docs": "FAKE_DOCS",
+    "counterfeit": "COUNTERFEIT",
+    "blackmail": "BLACKMAIL",
+    "phishing": "PHISHING",
+    "fake_shop": "FAKE_SHOP",
+    "job_scam": "JOB_SCAM",
+    "romance_scam": "ROMANCE_SCAM",
+    "gambling": "GAMBLING",
+    "general_scam": "GENERAL_SCAM",
+    "other": "OTHER",
+    "pension_scam": "PYRAMID",
+    
 }
 
 def normalize_category(value: Optional[str]) -> str:
