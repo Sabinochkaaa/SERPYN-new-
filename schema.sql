@@ -142,23 +142,29 @@ CREATE TABLE IF NOT EXISTS categories (
 CREATE INDEX IF NOT EXISTS idx_categories_code ON categories(code);
 CREATE INDEX IF NOT EXISTS idx_categories_group ON categories(category_group);
 
--- Теги
+-- Таблица тегов (с проверкой существования колонок)
 CREATE TABLE IF NOT EXISTS tags (
     id BIGSERIAL PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
-    label_ru TEXT,
-    label_kk TEXT,
-    label_en TEXT,
-    color TEXT,
     created_at TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS post_tags (
-    post_id BIGINT NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
-    tag_id BIGINT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
-    created_at TIMESTAMPTZ DEFAULT now(),
-    PRIMARY KEY (post_id, tag_id)
-);
+-- Добавляем недостающие колонки (если их нет)
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='tags' AND column_name='label_ru') THEN
+        ALTER TABLE tags ADD COLUMN label_ru TEXT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='tags' AND column_name='label_kk') THEN
+        ALTER TABLE tags ADD COLUMN label_kk TEXT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='tags' AND column_name='label_en') THEN
+        ALTER TABLE tags ADD COLUMN label_en TEXT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='tags' AND column_name='color') THEN
+        ALTER TABLE tags ADD COLUMN color TEXT;
+    END IF;
+END $$;
 
 -- Таблица алертов
 CREATE TABLE IF NOT EXISTS alerts (
