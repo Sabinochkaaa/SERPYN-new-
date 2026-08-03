@@ -495,7 +495,13 @@ async def ensure_columns(conn: asyncpg.Connection, table_name: str, extra_data: 
             logger.error(f"Не удалось добавить колонку {col}: {e}")
             safe_data.pop(col, None)
     return safe_data
-
+    
+def escape_markdown(text: str) -> str:
+    """Экранирует специальные символы для Markdown (Telegram)."""
+    chars = r'_*[]()~`>#+-=|{}.!@'
+    for ch in chars:
+        text = text.replace(ch, '\\' + ch)
+    return text
 # ============================================================
 # TELEGRAM УВЕДОМЛЕНИЯ
 # ============================================================
