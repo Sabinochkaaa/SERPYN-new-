@@ -1,10 +1,25 @@
+"""
+SERPYN 2.0 — Анти-скам платформа
+Универсальный бэкенд для мониторинга рекламы и подозрительных постов
+во всех популярных соцсетях (YouTube, TikTok, Instagram, Telegram,
+Threads, Facebook, VK, сайты и т.д.).
+
+Особенности:
+  * Единый универсальный эндпоинт приёма данных /ingest (+ /ingest/youtube для совместимости)
+  * Динамические категории угроз (хранятся в БД, легко расширяются через /categories)
+  * Автоматическое извлечение и шифрование чувствительных сущностей
+  * Доказательная база (evidence) со скриншотами в Supabase Storage
+  * Telegram-уведомления обо всех новых находках
+  * Сервер устойчив к нестандартным/неполным входным данным — не падает с 500
+"""
+
+import base64
 import hashlib
 import json
 import logging
 import os
 import re
 import secrets
-import base64
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -16,58 +31,265 @@ from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 load_dotenv()
 
-# ---------- НАСТРОЙКА ЛОГИРОВАНИЯ ----------
+# ============================================================
+# ЛОГИРОВАНИЕ
+# ============================================================
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("serpyn")
 
-# ---------- ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ----------
+# ============================================================
+# ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
+# ============================================================
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 INGEST_TOKEN = os.getenv("INGEST_TOKEN", "").strip()
 DATA_ENCRYPTION_KEY = os.getenv("DATA_ENCRYPTION_KEY", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+DASHBOARD_URL = os.getenv("DASHBOARD_URL", "").strip()
 CORS_ORIGINS = [x.strip() for x in os.getenv("CORS_ORIGINS", "*").split(",") if x.strip()]
 MAX_POOL_SIZE = int(os.getenv("DB_POOL_MAX_SIZE", "10"))
+
+# Порог для автоматического повышения категории CLEAN -> SUSPICIOUS -> угроза
 RISK_THRESHOLD_HIGH = float(os.getenv("RISK_THRESHOLD_HIGH", "0.75"))
-RISK_THRESHOLD_MEDIUM = float(os.getenv("RISK_THRESHOLD_MEDIUM", "0.0"))  # 0.0 – все уведомления
+RISK_THRESHOLD_MEDIUM = float(os.getenv("RISK_THRESHOLD_MEDIUM", "0.5"))
+# Минимальный риск для отправки Telegram-алерта. По умолчанию 0 —
+# уведомление уходит по КАЖДОЙ новой находке (кроме категории CLEAN).
+ALERT_MIN_RISK = float(os.getenv("ALERT_MIN_RISK", "0.0"))
+
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "").strip()
 
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL не задан.")
+    raise RuntimeError("DATABASE_URL не задан. Добавьте строку подключения PostgreSQL/Supabase.")
 if not INGEST_TOKEN:
-    logger.warning("INGEST_TOKEN не задан: /ingest не защищён.")
+    logger.warning("INGEST_TOKEN не задан: эндпоинты приёма данных не защищены!")
 
-# ---------- ШИФРОВАНИЕ ----------
+# ============================================================
+# ШИФРОВАНИЕ ЧУВСТВИТЕЛЬНЫХ ДАННЫХ
+# ============================================================
 fernet: Optional[Fernet] = None
 if DATA_ENCRYPTION_KEY:
     try:
         fernet = Fernet(DATA_ENCRYPTION_KEY.encode("utf-8"))
     except Exception as e:
-        raise RuntimeError("Неверный DATA_ENCRYPTION_KEY.") from e
+        raise RuntimeError("Неверный DATA_ENCRYPTION_KEY (должен быть Fernet-ключом).") from e
 else:
-    logger.warning("DATA_ENCRYPTION_KEY не задан: чувствительные данные не шифруются.")
+    logger.warning("DATA_ENCRYPTION_KEY не задан: чувствительные данные НЕ будут шифроваться.")
 
-# ---------- SUPABASE CLIENT (для скриншотов) ----------
+# ============================================================
+# SUPABASE STORAGE КЛИЕНТ (для /upload_screenshot)
+# ============================================================
 supabase_client = None
 if SUPABASE_URL and SUPABASE_SERVICE_KEY:
     try:
         from supabase import create_client
         supabase_client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-        logger.info("Supabase client initialized")
     except Exception as e:
-        logger.error(f"Supabase init error: {e}")
+        logger.error(f"Не удалось инициализировать Supabase-клиент: {e}")
+else:
+    logger.warning("SUPABASE_URL/SUPABASE_SERVICE_KEY не заданы: /upload_screenshot будет недоступен.")
 
 pool: Optional[asyncpg.Pool] = None
 
-# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
+# ============================================================
+# ДИНАМИЧЕСКИЕ КАТЕГОРИИ (кэш в памяти, источник истины — таблица categories)
+# ============================================================
+CATEGORY_CACHE: Dict[str, dict] = {}   # code -> {group, name_ru, name_kk, name_en, ...}
+FALLBACK_CATEGORY = "UNKNOWN"
+
+async def reload_category_cache() -> None:
+    """Перечитывает справочник категорий из БД в память."""
+    global CATEGORY_CACHE
+    assert pool is not None
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM categories WHERE is_active = true")
+    CATEGORY_CACHE = {row["code"]: dict(row) for row in rows}
+    logger.info(f"Загружено {len(CATEGORY_CACHE)} категорий угроз в кэш")
+
+async def ensure_category_exists(code: str) -> None:
+    """Если категории нет в кэше — пробуем найти в БД (могла быть добавлена
+    другим воркером), иначе ничего не делаем (используется UNKNOWN)."""
+    if code in CATEGORY_CACHE:
+        return
+    assert pool is not None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM categories WHERE code = $1 AND is_active = true", code)
+    if row:
+        CATEGORY_CACHE[code] = dict(row)
+
+# Синонимы/ключевые слова на RU / KZ / EN -> код категории.
+# Используются для распознавания категории из свободного текста тегов.
+CATEGORY_ALIASES: Dict[str, str] = {
+    # --- финансовые пирамиды ---
+    "пирамида": "PYRAMID", "финансовая пирамида": "PYRAMID",
+    "қаржы пирамидасы": "PYRAMID", "қаржылық пирамида": "PYRAMID",
+    "pyramid scheme": "PYRAMID", "financial pyramid": "PYRAMID",
+    "понци": "PONZI", "ponzi": "PONZI", "понци схемасы": "PONZI",
+    "mlm": "MLM_SCAM", "сетевой маркетинг": "MLM_SCAM", "желілік маркетинг": "MLM_SCAM",
+    "криптопирамида": "CRYPTO_PYRAMID", "крипто пирамида": "CRYPTO_PYRAMID", "crypto pyramid": "CRYPTO_PYRAMID",
+    "криптомошенничество": "CRYPTO_SCAM", "крипто алаяқтық": "CRYPTO_SCAM", "crypto scam": "CRYPTO_SCAM",
+    "гарантированный доход": "HIGH_YIELD", "кепілдік табыс": "HIGH_YIELD",
+    "высокая доходность": "HIGH_YIELD", "жоғары табыстылық": "HIGH_YIELD",
+    "пассивный доход": "HIGH_YIELD", "пассивті табыс": "HIGH_YIELD",
+    "guaranteed income": "HIGH_YIELD", "guaranteed profit": "HIGH_YIELD",
+    "реферальная программа": "REFERRAL_SCHEME", "рефералдық бағдарлама": "REFERRAL_SCHEME",
+    "партнёрская программа": "REFERRAL_SCHEME", "referral program": "REFERRAL_SCHEME",
+    "инвестиционное мошенничество": "INVESTMENT_SCAM", "инвестициялық алаяқтық": "INVESTMENT_SCAM",
+    "investment scam": "INVESTMENT_SCAM", "инвестируй": "INVESTMENT_SCAM",
+    "фальшивый брокер": "FAKE_BROKER", "жалған брокер": "FAKE_BROKER", "fake broker": "FAKE_BROKER",
+    "поддельная биржа": "FAKE_EXCHANGE", "жалған биржа": "FAKE_EXCHANGE", "fake exchange": "FAKE_EXCHANGE",
+    "незарегистрированный фонд": "UNREGISTERED_FUND", "тіркелмеген қор": "UNREGISTERED_FUND",
+    "без лицензии": "UNLICENSED_FINANCE", "лицензиясыз": "UNLICENSED_FINANCE", "unlicensed": "UNLICENSED_FINANCE",
+    "финансовое мошенничество": "FINANCIAL_FRAUD", "қаржылық алаяқтық": "FINANCIAL_FRAUD",
+    "financial fraud": "FINANCIAL_FRAUD",
+
+    # --- наркотики ---
+    "наркотик": "DRUGS", "наркота": "DRUGS", "есірткі": "DRUGS", "drugs": "DRUGS", "drug sale": "DRUGS",
+    "кладмен": "DRUG_DEALER", "закладчик": "DRUG_DEALER", "закладка": "DRUG_DEALER",
+    "клад": "DRUG_DEALER", "kladmen": "DRUG_DEALER", "dead drop": "DRUG_DEALER",
+    "работа закладчиком": "DRUG_RECRUITMENT", "требуется курьер": "DRUG_RECRUITMENT",
+    "лёгкий заработок курьером": "DRUG_RECRUITMENT",
+
+    # --- оружие ---
+    "оружие": "WEAPONS", "қару-жарақ": "WEAPONS", "weapon": "WEAPONS", "weapons sale": "WEAPONS",
+
+    # --- документы / подделки ---
+    "подделка документов": "FORGERY", "құжат жасау": "FORGERY", "document forgery": "FORGERY",
+    "фальшивые документы": "FORGERY", "жалған құжат": "FORGERY",
+    "права без экзамена": "FAKE_LICENSE", "купить диплом": "FAKE_LICENSE",
+    "жалған куәлік": "FAKE_LICENSE", "fake license": "FAKE_LICENSE", "fake diploma": "FAKE_LICENSE",
+    "контрафакт": "COUNTERFEIT", "контрафактілі өнім": "COUNTERFEIT", "counterfeit": "COUNTERFEIT",
+    "подделка товара": "COUNTERFEIT",
+
+    # --- онлайн-мошенничество ---
+    "фишинг": "PHISHING", "phishing": "PHISHING",
+    "фейк магазин": "FAKE_SHOP", "поддельный магазин": "FAKE_SHOP", "жалған дүкен": "FAKE_SHOP", "fake shop": "FAKE_SHOP",
+    "фейк работа": "FAKE_JOB", "ложная вакансия": "FAKE_JOB", "жалған жұмыс": "FAKE_JOB", "fake job": "FAKE_JOB",
+    "романтик скам": "ROMANCE_SCAM", "love scam": "ROMANCE_SCAM", "романтикалық алаяқтық": "ROMANCE_SCAM",
+    "кража данных": "IDENTITY_THEFT", "жеке деректерді ұрлау": "IDENTITY_THEFT", "identity theft": "IDENTITY_THEFT",
+    "фальшивая благотворительность": "FAKE_CHARITY", "жалған қайырымдылық": "FAKE_CHARITY", "fake charity": "FAKE_CHARITY",
+
+    # --- прочее незаконное ---
+    "азартные игры": "GAMBLING", "казино": "GAMBLING", "құмар ойын": "GAMBLING", "gambling": "GAMBLING",
+    "вымогательство": "EXTORTION", "рэкет": "EXTORTION", "бопсалау": "EXTORTION", "extortion": "EXTORTION",
+    "незаконные услуги": "ILLEGAL_SERVICES", "заңсыз қызмет": "ILLEGAL_SERVICES", "illegal services": "ILLEGAL_SERVICES",
+    "торговля людьми": "HUMAN_TRAFFICKING", "адам саудасы": "HUMAN_TRAFFICKING", "human trafficking": "HUMAN_TRAFFICKING",
+    "экстремизм": "EXTREMISM", "экстремистік": "EXTREMISM", "extremism": "EXTREMISM",
+
+    # --- нейтральные ---
+    "чисто": "CLEAN", "таза": "CLEAN", "clean": "CLEAN",
+    "подозрительно": "SUSPICIOUS", "күдікті": "SUSPICIOUS", "suspicious": "SUSPICIOUS",
+    "скам": "OTHER_SCAM", "мошенничество": "OTHER_SCAM", "алаяқтық": "OTHER_SCAM", "scam": "OTHER_SCAM",
+}
+
+def normalize_category(value: Optional[str]) -> str:
+    """Приводит произвольную категорию (RU/KZ/EN/код) к известному коду.
+    Никогда не бросает исключение — в худшем случае вернёт UNKNOWN."""
+    if not value:
+        return FALLBACK_CATEGORY
+    raw = str(value).strip()
+    if not raw:
+        return FALLBACK_CATEGORY
+    upper = re.sub(r"[^A-Za-z0-9_]+", "_", raw.upper()).strip("_")
+    if upper in CATEGORY_CACHE:
+        return upper
+    low = raw.lower()
+    for alias, code in CATEGORY_ALIASES.items():
+        if alias in low:
+            return code
+    # частичное совпадение по существующим кодам категорий
+    for code in CATEGORY_CACHE:
+        if code.lower() in low or low in code.lower():
+            return code
+    return FALLBACK_CATEGORY
+
+# ============================================================
+# ТИПЫ СУЩНОСТЕЙ И ИСТОЧНИКОВ (гибкие — неизвестное значение не ломает запрос)
+# ============================================================
+ENTITY_TYPES = {
+    "CHANNEL", "ACCOUNT", "PERSON", "COMPANY", "PROJECT", "WEBSITE", "DOMAIN",
+    "PHONE", "EMAIL", "BANK_CARD", "IBAN", "WALLET", "USERNAME", "ADDRESS",
+    "TELEGRAM_BOT", "WHATSAPP_NUMBER", "SOCIAL_MEDIA", "CRYPTO_EXCHANGE", "OTHER",
+}
+
+SOURCE_TYPES = {
+    "YOUTUBE", "TELEGRAM", "TIKTOK", "INSTAGRAM", "THREADS", "WEBSITE",
+    "NEWS", "FORUM", "COMPLAINT", "MANUAL", "OTHER", "FACEBOOK", "VK", "ODNOKLASSNIKI",
+    "TWITTER", "X", "LINKEDIN", "SNAPCHAT", "DISCORD", "WHATSAPP", "VIBER",
+}
+
+EVIDENCE_TYPES = {"SCREENSHOT", "IMAGE", "VIDEO", "HTML", "PDF", "ARCHIVE", "AUDIO", "OTHER"}
+
+SENSITIVE_ENTITY_TYPES = {"PHONE", "EMAIL", "BANK_CARD", "IBAN", "WALLET", "ADDRESS"}
+
+# Колонки posts, которые нельзя перезаписать через extra
+RESERVED_POST_COLUMNS = {
+    "id", "source_id", "external_id", "url", "title", "author", "published_at",
+    "raw_text", "normalized_text", "language", "category", "risk_score",
+    "confidence", "explanation", "red_flags", "keywords", "model", "extra",
+    "analyzed_at", "created_at", "updated_at",
+}
+SAFE_COLUMN_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,58}$")
+
+# ============================================================
+# ПРИЗНАКИ РИСКА (мультиязычные, эвристики для авто-повышения риска)
+# ============================================================
+RED_FLAG_PATTERNS = [
+    # финансовые пирамиды / доходность
+    r"гаранти(?:ру|ро)ванн(?:ый|ая|ое|ые)\s+(?:доход|прибыль|выплат)",
+    r"пассивн(?:ый|ая|ое|ые)\s+(?:доход|прибыль)",
+    r"приглашай\s+друзей", r"реферальн(?:ый|ая|ое|ые)\s+(?:программ|бонус)",
+    r"бонус\s+за\s+регистраци", r"удвоени[ею]\s+(?:депозит|вклад|сумм)",
+    r"без\s+риск[ао]", r"гарантия\s+возврат",
+    r"высок(?:ий|ая|ое|ие)\s+(?:доход|прибыль|процент)", r"доход\s+от\s+(\d+)\s*%",
+    r"вложи\s+и\s+получи", r"заработок\s+в\s+интернет", r"крипто(?:валютн|)\s+(?:пирамид|схем)",
+    r"mlm", r"сетевой\s+бизнес", r"пассивный\s+заработок", r"лёгкие\s+деньги",
+    r"быстрый\s+заработок", r"только\s+сегодня", r"спешите", r"успей",
+    r"акция\s+ограничена", r"инвестируй\s+сейчас", r"персональный\s+менеджер",
+    r"оффшор", r"нерезидент", r"без\s+проверк", r"скрытый\s+платеж",
+    r"комиссия\s+за\s+вывод", r"блокировка\s+счета",
+    r"кепілдік\s+табыс", r"пассивті\s+табыс", r"депозитті\s+екі\s+есеге\s+көбейту",
+    r"рефералдық\s+бағдарлама", r"тіркеу\s+бонусы", r"достарды\s+шақыру",
+    r"тәуекелсіз", r"жоғары\s+табыс", r"жылдам\s+табыс", r"оңай\s+ақша",
+    r"инвестиция\s+пирамидасы", r"қаржы\s+пирамидасы", r"заңсыз\s+қор", r"лицензиясыз",
+    # вакансии / вербовка (могут маскировать наркоторговлю)
+    r"работа\s+курьером\s+без\s+опыта", r"высокая\s+оплата\s+в\s+день",
+    r"требуется\s+курьер", r"работа\s+закладчиком", r"легкий\s+заработок\s+без\s+вложений",
+    # документы/лицензии
+    r"права\s+без\s+экзамена", r"диплом\s+без\s+учёбы", r"удостоверение\s+(?:личности\s+)?сделать",
+    r"изготовление\s+документов",
+    # общие мошеннические паттерны
+    r"схема", r"алаяқтық", r"scam", r"развод\s+на\s+деньги",
+]
+
+KZ_CITY_ALIASES = {
+    "астана": "Astana", "нур-султан": "Astana", "nur-sultan": "Astana",
+    "алматы": "Almaty", "шымкент": "Shymkent", "қарағанды": "Karaganda",
+    "караганда": "Karaganda", "ақтөбе": "Aktobe", "актобе": "Aktobe",
+    "атырау": "Atyrau", "ақтау": "Aktau", "актау": "Aktau",
+    "павлодар": "Pavlodar", "семей": "Semey", "өскемен": "Ust-Kamenogorsk",
+    "усть-каменогорск": "Ust-Kamenogorsk", "қостанай": "Kostanay",
+    "костанай": "Kostanay", "петропавл": "Petropavl", "көкшетау": "Kokshetau",
+    "кокшетау": "Kokshetau", "тараз": "Taraz", "түркістан": "Turkistan",
+    "туркестан": "Turkistan", "қызылорда": "Kyzylorda", "кызылорда": "Kyzylorda",
+    "талдықорған": "Taldykorgan", "талдыкорган": "Taldykorgan",
+    "oral": "Uralsk", "жетісай": "Zhetisay", "аркалық": "Arkalyk",
+    "екібастұз": "Ekibastuz", "rudny": "Rudny", "қонаев": "Konaev",
+    "сарыағаш": "Saryagash", "шардара": "Shardara", "жаңатас": "Zhanatas",
+    "қаратау": "Karatau", "балқаш": "Balkhash", "приозерск": "Priozersk",
+    "сатпаев": "Satpayev",
+}
+
+# ============================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ============================================================
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -75,17 +297,43 @@ def parse_dt(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
     try:
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except (ValueError, TypeError):
         return None
 
+def normalize_source_type(value: Optional[str]) -> str:
+    if not value:
+        return "OTHER"
+    cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", str(value).upper()).strip("_")
+    return cleaned if cleaned in SOURCE_TYPES else "OTHER"
+
+def normalize_entity_type(value: Optional[str]) -> str:
+    if not value:
+        return "OTHER"
+    cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", str(value).upper()).strip("_")
+    return cleaned if cleaned in ENTITY_TYPES else "OTHER"
+
+def normalize_evidence_type(value: Optional[str]) -> str:
+    if not value:
+        return "OTHER"
+    cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", str(value).upper()).strip("_")
+    return cleaned if cleaned in EVIDENCE_TYPES else "OTHER"
+
+def normalize_entity_value(entity_type: str, value: str) -> str:
+    value = (value or "").strip()
+    if entity_type in {"PHONE", "BANK_CARD", "IBAN"}:
+        return re.sub(r"[^0-9A-Za-z+]", "", value).upper()
+    if entity_type in {"EMAIL", "DOMAIN", "WEBSITE", "USERNAME", "WALLET", "TELEGRAM_BOT"}:
+        return value.lower()
+    return re.sub(r"\s+", " ", value).strip().lower()
+
 def hash_value(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
-def encrypt_value(value: str) -> str:
+def encrypt_value(value: str) -> Optional[str]:
     if not fernet:
-        raise HTTPException(status_code=503, detail="DATA_ENCRYPTION_KEY не настроен")
+        return None
     return fernet.encrypt(value.encode("utf-8")).decode("utf-8")
 
 def decrypt_value(value: Optional[str]) -> Optional[str]:
@@ -94,7 +342,7 @@ def decrypt_value(value: Optional[str]) -> Optional[str]:
     try:
         return fernet.decrypt(value.encode("utf-8")).decode("utf-8")
     except InvalidToken:
-        logger.error("Ошибка расшифровки: неверный ключ")
+        logger.error("Ошибка расшифровки: неверный ключ или повреждённые данные")
         return None
 
 def mask_value(entity_type: str, normalized: str) -> str:
@@ -114,7 +362,10 @@ def mask_value(entity_type: str, normalized: str) -> str:
     return normalized
 
 def infer_city(*texts: Optional[str]) -> Optional[str]:
-    # упрощённо, можно использовать готовый словарь
+    joined = " ".join(t for t in texts if t).lower()
+    for alias, canonical in KZ_CITY_ALIASES.items():
+        if alias in joined:
+            return canonical
     return None
 
 def severity_for(risk: float) -> str:
@@ -129,187 +380,167 @@ def severity_for(risk: float) -> str:
 def detect_red_flags(text: str) -> List[str]:
     if not text:
         return []
-    patterns = [
-        r"гаранти(?:ру|ро)ванн(?:ый|ая|ое|ные)\s+(?:доход|прибыль|выплат)",
-        r"пассивн(?:ый|ая|ое|ые)\s+(?:доход|прибыль)",
-        r"приглашай\s+друзей",
-        r"реферальн(?:ый|ая|ое|ые)\s+(?:программ|бонус)",
-        r"бонус\s+за\s+регистраци",
-        r"без\s+риск[ао]",
-        r"гарантия\s+возврат",
-        r"высок(?:ий|ая|ое|ие)\s+(?:доход|прибыль|процент)",
-        r"доход\s+от\s+(\d+)\s*%",
-        r"вложи\s+и\s+получи",
-        r"заработок\s+в\s+интернет",
-        r"крипто(?:валютн|)\s+(?:пирамид|схем)",
-        r"mlm",
-        r"сетевой\s+бизнес",
-        r"лёгкие\s+деньги",
-        r"быстрый\s+заработок",
-        r"только\s+сегодня",
-        r"спешите",
-        r"успей",
-        r"акция\s+ограничена",
-        r"инвестируй\s+сейчас",
-        r"персональный\s+менеджер",
-        r"оффшор",
-        r"нерезидент",
-        r"без\s+проверк",
-        r"скрытый\s+платеж",
-        r"комиссия\s+за\s+вывод",
-        r"блокировка\s+счета",
-        # Казахские
-        r"кепілдік\s+табыс",
-        r"пассивті\s+табыс",
-        r"рефералдық\s+бағдарлама",
-        r"тіркеу\s+бонусы",
-        r"достарды\s+шақыру",
-        r"тәуекелсіз",
-        r"жоғары\s+табыс",
-        r"жылдам\s+табыс",
-        r"оңай\s+ақша",
-        r"инвестиция\s+пирамидасы",
-        r"қаржы\s+пирамидасы",
-        r"схема",
-        r"алаяқтық",
-        r"заңсыз\s+қор",
-        r"лицензиясыз",
-    ]
     flags = []
-    for p in patterns:
-        if re.search(p, text, re.IGNORECASE):
-            flags.append(p)
+    for pattern in RED_FLAG_PATTERNS:
+        try:
+            if re.search(pattern, text, re.IGNORECASE):
+                flags.append(pattern)
+        except re.error:
+            continue
     return list(set(flags))
 
 def compute_risk_boost(flags: List[str]) -> float:
-    cnt = len(flags)
-    if cnt == 0:
+    count = len(flags)
+    if count == 0:
         return 0.0
-    if cnt <= 2:
+    if count <= 2:
         return 0.1
-    if cnt <= 4:
+    if count <= 4:
         return 0.2
     return 0.3
 
 def extract_keywords(text: str) -> List[str]:
     if not text:
         return []
-    words = re.findall(r'\b[а-яА-ЯёЁa-zA-Z]{3,}\b', text.lower())
+    words = re.findall(r"\b[а-яА-ЯёЁa-zA-Z]{3,}\b", text.lower())
     stop = {"это", "все", "так", "для", "без", "или", "но", "если", "то", "что", "как"}
     return [w for w in words if w not in stop][:10]
 
-def normalize_entity_value(entity_type: str, value: str) -> str:
-    value = value.strip()
-    if entity_type in {"PHONE", "BANK_CARD", "IBAN"}:
-        return re.sub(r"[^0-9A-Za-z+]", "", value).upper()
-    if entity_type in {"EMAIL", "DOMAIN", "WEBSITE", "USERNAME", "WALLET", "TELEGRAM_BOT"}:
-        return value.lower()
-    return re.sub(r"\s+", " ", value).strip().lower()
+def safe_json(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        return json.dumps(str(value), ensure_ascii=False)
 
-# ---------- ДИНАМИЧЕСКИЕ КОЛОНКИ ----------
-async def ensure_columns(conn: asyncpg.Connection, table_name: str, extra_data: Dict[str, Any]) -> None:
+def stable_item_id(*parts: Optional[str]) -> str:
+    joined = "|".join(p for p in parts if p)
+    if not joined:
+        joined = uuid.uuid4().hex
+    return hash_value(joined)[:24]
+
+# ============================================================
+# ДИНАМИЧЕСКОЕ ДОБАВЛЕНИЕ КОЛОНОК (для произвольных extra-полей)
+# ============================================================
+async def ensure_columns(conn: asyncpg.Connection, table_name: str, extra_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Гарантирует наличие TEXT-колонок для ключей extra_data. Возвращает
+    только те пары, которые безопасно использовать как имена колонок."""
     if not extra_data:
-        return
+        return {}
+    safe_data = {}
+    for col, val in extra_data.items():
+        if not SAFE_COLUMN_RE.match(col) or col.lower() in RESERVED_POST_COLUMNS:
+            continue
+        safe_data[col] = val
+    if not safe_data:
+        return {}
+
     existing = await conn.fetch(
         """
-        SELECT column_name, data_type
-        FROM information_schema.columns
+        SELECT column_name FROM information_schema.columns
         WHERE table_name = $1 AND table_schema = 'public'
         """,
-        table_name
+        table_name,
     )
-    existing_cols = {row['column_name'] for row in existing}
-    for col, val in extra_data.items():
+    existing_cols = {row["column_name"] for row in existing}
+    for col in safe_data:
         if col in existing_cols:
             continue
         try:
-            await conn.execute(f'ALTER TABLE {table_name} ADD COLUMN "{col}" TEXT')
-            logger.info(f"Добавлена колонка {col} типа TEXT в таблицу {table_name}")
+            await conn.execute(f'ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS "{col}" TEXT')
+            logger.info(f"Добавлена колонка '{col}' (TEXT) в таблицу {table_name}")
         except Exception as e:
-            logger.error(f"Ошибка добавления колонки {col}: {e}")
+            logger.error(f"Не удалось добавить колонку {col}: {e}")
+            safe_data.pop(col, None)
+    return safe_data
 
-# ---------- TELEGRAM УВЕДОМЛЕНИЯ ----------
+# ============================================================
+# TELEGRAM УВЕДОМЛЕНИЯ
+# ============================================================
 async def send_telegram_alert(
     title: str,
     category: str,
     risk_score: float,
     source_name: str,
-    post_url: str = None,
-    evidence_urls: List[str] = None,
-):
+    source_type: str = "",
+    post_url: Optional[str] = None,
+    evidence_urls: Optional[List[str]] = None,
+) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram не настроен")
+        logger.debug("Telegram не настроен (нет TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)")
         return
 
+    cat_info = CATEGORY_CACHE.get(category, {})
+    cat_label = cat_info.get("name_ru") or category
+
     message = (
-        f"🚨 *Новое подозрительное обнаружение!*\n"
-        f"📌 *Источник:* {source_name}\n"
-        f"📂 *Категория:* `{category}`\n"
-        f"📊 *Риск:* {risk_score:.2f}\n"
-        f"📝 *Тема:* {title[:200]}\n"
+        f"🚨 *Новое обнаружение — SERPYN*\n"
+        f"📌 *Источник:* {source_name} ({source_type or '—'})\n"
+        f"📂 *Категория:* `{category}` — {cat_label}\n"
+        f"📊 *Риск:* {risk_score:.2f} ({severity_for(risk_score)})\n"
+        f"📝 *Тема:* {(title or '')[:200]}\n"
     )
     if post_url:
         message += f"\n🔗 [Открыть пост]({post_url})"
 
-    keyboard = {
-        "inline_keyboard": [
-            [{"text": "📊 Открыть дашборд", "url": "https://serpyn-serpyn.up.railway.app/"}]
-        ]
-    }
+    reply_markup = None
+    if DASHBOARD_URL:
+        reply_markup = {"inline_keyboard": [[{"text": "📊 Открыть дашборд", "url": DASHBOARD_URL}]]}
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
-            await client.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message,
-                    "parse_mode": "Markdown",
-                    "disable_web_page_preview": True,
-                    "reply_markup": keyboard,
-                },
-            )
+            payload = {
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+                "parse_mode": "Markdown",
+                "disable_web_page_preview": True,
+            }
+            if reply_markup:
+                payload["reply_markup"] = reply_markup
+            await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json=payload)
             if evidence_urls:
                 for url in evidence_urls[:10]:
                     await client.post(
                         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-                        json={
-                            "chat_id": TELEGRAM_CHAT_ID,
-                            "photo": url,
-                            "caption": f"📸 Скриншот: {title[:50]}",
-                        },
+                        json={"chat_id": TELEGRAM_CHAT_ID, "photo": url, "caption": f"📸 {(title or '')[:60]}"},
                     )
             logger.info("Telegram-уведомление отправлено")
-        except Exception as e:
-            logger.exception("Ошибка отправки в Telegram")
+        except Exception:
+            logger.exception("Ошибка отправки Telegram-уведомления")
 
-# ---------- PYDANTIC МОДЕЛИ ----------
+# ============================================================
+# PYDANTIC МОДЕЛИ (максимально терпимые к «кривым» данным парсеров)
+# ============================================================
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="allow", str_strip_whitespace=True)
 
 class EntityInput(StrictModel):
-    entity_type: str
-    value: str
-    role: Optional[str] = None
-    confidence: float = 1.0
-    risk_score: Optional[float] = None
+    entity_type: str = "OTHER"
+    value: str = Field(min_length=1, max_length=4000)
+    role: Optional[str] = Field(default=None, max_length=100)
+    confidence: float = Field(default=1.0, ge=0, le=1)
+    risk_score: Optional[float] = Field(default=None, ge=0, le=1)
     category: Optional[str] = None
     country: Optional[str] = None
     city: Optional[str] = None
-    metadata: dict[str, Any] = {}
+    metadata: dict[str, Any] = Field(default_factory=dict)
     excerpt: Optional[str] = None
+
+    @field_validator("entity_type", mode="before")
+    @classmethod
+    def validate_entity_type(cls, v: Any) -> str:
+        return normalize_entity_type(str(v) if v is not None else None)
 
 class RelationInput(StrictModel):
     source_ref: str
     target_ref: str
-    relation_type: str
-    confidence: float = 1.0
-    risk_score: float = 0.0
+    relation_type: str = Field(default="RELATED_TO", max_length=100)
+    confidence: float = Field(default=1.0, ge=0, le=1)
+    risk_score: float = Field(default=0.0, ge=0, le=1)
     description: Optional[str] = None
-    metadata: dict[str, Any] = {}
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 class EvidenceInput(StrictModel):
-    evidence_type: str
+    evidence_type: str = "OTHER"
     storage_url: str
     original_url: Optional[str] = None
     sha256: Optional[str] = None
@@ -317,20 +548,26 @@ class EvidenceInput(StrictModel):
     captured_at: Optional[str] = None
     captured_by: Optional[str] = None
     entity_ref: Optional[str] = None
-    metadata: dict[str, Any] = {}
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("evidence_type", mode="before")
+    @classmethod
+    def validate_evidence_type(cls, v: Any) -> str:
+        return normalize_evidence_type(str(v) if v is not None else None)
 
 class IngestRequest(StrictModel):
     request_id: Optional[str] = None
     project: str = "SERPYN"
-    source_type: str
-    source_name: str
+    source_type: str = "OTHER"
+    source_name: str = "Unknown source"
     source_external_id: Optional[str] = None
     source_username: Optional[str] = None
     source_url: Optional[str] = None
     source_city: Optional[str] = None
     source_country: str = "KZ"
-    source_meta: dict[str, Any] = {}
-    item_id: str
+    source_meta: dict[str, Any] = Field(default_factory=dict)
+
+    item_id: Optional[str] = None
     item_url: Optional[str] = None
     title: Optional[str] = None
     author: Optional[str] = None
@@ -338,55 +575,116 @@ class IngestRequest(StrictModel):
     normalized_text: Optional[str] = None
     published_at: Optional[str] = None
     language: Optional[str] = None
+
     category: str = "UNKNOWN"
-    risk_score: float = 0.0
-    confidence: float = 0.0
+    risk_score: float = Field(default=0.0, ge=0, le=1)
+    confidence: float = Field(default=0.0, ge=0, le=1)
     explanation: Optional[str] = None
-    red_flags: list[str] = []
-    keywords: list[str] = []
+    red_flags: list[str] = Field(default_factory=list)
+    keywords: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
     model: Optional[str] = None
-    extra: dict[str, Any] = {}
-    entities: list[EntityInput] = []
-    relations: list[RelationInput] = []
-    evidence: list[EvidenceInput] = []
+    extra: dict[str, Any] = Field(default_factory=dict)
 
-class UploadScreenshotRequest(BaseModel):
-    file_name: str
-    file_data: str
-    folder: str = "screenshots"
+    entities: list[EntityInput] = Field(default_factory=list)
+    relations: list[RelationInput] = Field(default_factory=list)
+    evidence: list[EvidenceInput] = Field(default_factory=list)
 
-class CategoryCreate(BaseModel):
-    name: str
-    label_ru: str
-    label_kk: Optional[str] = None
-    label_en: Optional[str] = None
-    description: Optional[str] = None
-    risk_default: float = 0.5
-    is_illegal: bool = False
-    icon: Optional[str] = None
-    color: Optional[str] = None
+    @field_validator("source_type", mode="before")
+    @classmethod
+    def validate_source_type(cls, v: Any) -> str:
+        return normalize_source_type(str(v) if v is not None else None)
 
-class TagCreate(BaseModel):
-    name: str
-    label_ru: str
-    label_kk: Optional[str] = None
-    label_en: Optional[str] = None
-    color: Optional[str] = None
+    @field_validator("category", mode="before")
+    @classmethod
+    def validate_category(cls, v: Any) -> str:
+        return normalize_category(str(v) if v is not None else None)
 
-# ---------- SQL-МИГРАЦИЯ ----------
+    @field_validator("risk_score", "confidence", mode="before")
+    @classmethod
+    def coerce_float(cls, v: Any) -> float:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @model_validator(mode="after")
+    def fill_item_id(self) -> "IngestRequest":
+        if not self.item_id or not str(self.item_id).strip():
+            self.item_id = stable_item_id(self.item_url, self.title, self.text, self.source_name)
+        return self
+
+# ---- МОДЕЛИ ДЛЯ YOUTUBE HUNTER (совместимость со старым парсером) ----
+class ArrfrCheck(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    is_blacklisted: bool = False
+    match_type: Optional[str] = None
+    matched_entry: Optional[str] = None
+    risk_boost: int = 0
+    reason: str = ""
+
+class DomainRisk(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    risk: int = 0
+    flags: List[str] = Field(default_factory=list)
+
+class YouTubeAdResult(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    advertiser_name: str = "Unknown"
+    advertiser_domain: str = ""
+    ad_text: str = ""
+    ad_title: str = ""
+    search_keyword: str = ""
+    screenshot_path: str = ""
+    screenshot_url: Optional[str] = None
+    transparency_url: str = ""
+    scraped_at: str = Field(default_factory=lambda: utcnow().isoformat())
+    risk_score: int = 0
+    verdict: str = "suspicious"
+    risk_flags: List[str] = Field(default_factory=list)
+    ai_reason: str = ""
+    target_audience: str = ""
+    scheme_type: str = ""
+    license_check: str = ""
+    advice_for_pensioner: str = ""
+    arrfr_check: ArrfrCheck = Field(default_factory=ArrfrCheck)
+    domain_risk: DomainRisk = Field(default_factory=DomainRisk)
+    analyzed_by: str = ""
+    analyzed: bool = True
+
+class YouTubeHunterPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    run_timestamp: str = Field(default_factory=lambda: utcnow().isoformat())
+    project: str = "serpin-youtube"
+    mode: str = "youtube_hunter"
+    summary: Dict[str, int] = Field(default_factory=dict)
+    ads: List[YouTubeAdResult] = Field(default_factory=list)
+
+class CategoryInput(BaseModel):
+    code: str
+    category_group: str = "OTHER"
+    name_ru: Optional[str] = None
+    name_kk: Optional[str] = None
+    name_en: Optional[str] = None
+    description_ru: Optional[str] = None
+    description_kk: Optional[str] = None
+    description_en: Optional[str] = None
+    default_severity: str = "MEDIUM"
+
+# ============================================================
+# МИГРАЦИИ / LIFESPAN
+# ============================================================
 async def run_migrations(db_pool: asyncpg.Pool) -> None:
     schema_path = os.path.join(os.path.dirname(__file__), "schema.sql")
-    if os.path.exists(schema_path):
-        with open(schema_path, "r", encoding="utf-8") as f:
-            sql = f.read()
-    else:
-        logger.error("schema.sql не найден")
+    if not os.path.exists(schema_path):
+        logger.error("schema.sql не найден рядом с main.py — таблицы не созданы!")
         return
+    with open(schema_path, "r", encoding="utf-8") as f:
+        sql = f.read()
     async with db_pool.acquire() as conn:
         await conn.execute(sql)
-    logger.info("Миграции выполнены")
+    logger.info("Миграции выполнены — все таблицы готовы")
 
-# ---------- LIFESPAN ----------
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global pool
@@ -399,13 +697,14 @@ async def lifespan(_: FastAPI):
         ssl="require" if "sslmode" not in DATABASE_URL else None,
     )
     await run_migrations(pool)
+    await reload_category_cache()
     yield
     await pool.close()
 
 app = FastAPI(
-    title="SERPYN 2.0 Anti-Scam API",
+    title="SERPYN 2.0 — Анти-скам платформа",
     version="2.0.0",
-    description="Универсальная платформа мониторинга мошенничества и скама",
+    description="Универсальный бэкенд мониторинга мошенничества и нелегального контента в соцсетях Казахстана.",
     lifespan=lifespan,
 )
 
@@ -413,31 +712,35 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
     allow_credentials=CORS_ORIGINS != ["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "X-Ingest-Token", "X-Request-ID"],
 )
 
-def require_ingest_token(x_ingest_token: Optional[str] = Header(default=None)):
+def require_ingest_token(x_ingest_token: Optional[str] = Header(default=None)) -> None:
     if not INGEST_TOKEN:
-        raise HTTPException(503, "INGEST_TOKEN не настроен")
+        raise HTTPException(503, "INGEST_TOKEN не настроен на сервере")
     if not x_ingest_token or not secrets.compare_digest(x_ingest_token, INGEST_TOKEN):
         raise HTTPException(401, "Неверный или отсутствующий X-Ingest-Token")
 
-# ---------- UPSERT ФУНКЦИИ ----------
-async def upsert_project(conn, name: str) -> int:
+# ============================================================
+# UPSERT-ФУНКЦИИ
+# ============================================================
+async def upsert_project(conn: asyncpg.Connection, name: str) -> int:
+    name = (name or "SERPYN").strip() or "SERPYN"
     return await conn.fetchval(
         "INSERT INTO projects(name) VALUES($1) ON CONFLICT(name) DO UPDATE SET updated_at=now() RETURNING id",
         name,
     )
 
-async def upsert_source(conn, project_id: int, ev: IngestRequest) -> int:
+async def upsert_source(conn: asyncpg.Connection, project_id: int, ev: IngestRequest) -> int:
     external_id = ev.source_external_id or ev.source_url or ev.source_username or ev.source_name
     city = ev.source_city or infer_city(ev.source_name, ev.source_url, ev.text)
     return await conn.fetchval(
         """
-        INSERT INTO sources(project_id, source_type, name, external_id, username, url,
-            platform_meta, city, country, last_seen, risk_score, category)
-        VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,now(),$10,$11)
+        INSERT INTO sources(
+            project_id, source_type, name, external_id, username, url,
+            platform_meta, city, country, last_seen, risk_score, category
+        ) VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,now(),$10,$11)
         ON CONFLICT(source_type, external_id) DO UPDATE SET
             project_id = EXCLUDED.project_id,
             name = EXCLUDED.name,
@@ -452,28 +755,21 @@ async def upsert_source(conn, project_id: int, ev: IngestRequest) -> int:
         RETURNING id
         """,
         project_id, ev.source_type, ev.source_name, external_id, ev.source_username,
-        ev.source_url, json.dumps(ev.source_meta, ensure_ascii=False), city,
+        ev.source_url, safe_json(ev.source_meta), city,
         ev.source_country, ev.risk_score, ev.category,
     )
 
-async def upsert_post(conn, source_id: int, ev: IngestRequest) -> int:
+async def upsert_post(conn: asyncpg.Connection, source_id: int, ev: IngestRequest) -> int:
     if not ev.language and ev.text:
-        if any(0x0400 < ord(ch) < 0x0500 for ch in ev.text):
-            ev.language = "ru"
-        else:
-            ev.language = "en"
+        ev.language = "ru" if any(0x0400 < ord(ch) < 0x0500 for ch in ev.text) else "en"
 
-    # Сериализация extra в JSON-строки
-    extra_serialized = {}
-    for key, val in ev.extra.items():
-        if not isinstance(val, str):
-            extra_serialized[key] = json.dumps(val, ensure_ascii=False)
-        else:
-            extra_serialized[key] = val
+    extra_serialized: Dict[str, str] = {}
+    for key, val in (ev.extra or {}).items():
+        extra_serialized[key] = val if isinstance(val, str) else safe_json(val)
 
-    await ensure_columns(conn, "posts", extra_serialized)
+    safe_extra = await ensure_columns(conn, "posts", extra_serialized)
 
-    insert_data = {
+    insert_data: Dict[str, Any] = {
         "source_id": source_id,
         "external_id": ev.item_id,
         "url": ev.item_url,
@@ -491,40 +787,40 @@ async def upsert_post(conn, source_id: int, ev: IngestRequest) -> int:
         "keywords": ev.keywords,
         "model": ev.model,
         "analyzed_at": utcnow(),
-        "extra": json.dumps(ev.extra, ensure_ascii=False) if ev.extra else "{}",
+        "extra": safe_json(ev.extra) if ev.extra else "{}",
     }
-
-    for key, val in extra_serialized.items():
-        insert_data[key] = val
+    insert_data.update(safe_extra)
 
     columns = list(insert_data.keys())
-    placeholders = [f"${i+1}" for i in range(len(columns))]
-    update_set = [f"{col} = EXCLUDED.{col}" for col in columns if col not in ("source_id", "external_id")]
+    placeholders = [f"${i + 1}" for i in range(len(columns))]
+    update_clause = ", ".join(f"{col} = EXCLUDED.{col}" for col in columns if col not in {"source_id", "external_id"})
+
     query = f"""
         INSERT INTO posts ({", ".join(columns)})
         VALUES ({", ".join(placeholders)})
         ON CONFLICT (source_id, external_id) DO UPDATE SET
-            {", ".join(update_set)},
+            {update_clause},
             updated_at = now()
         RETURNING id
     """
     return await conn.fetchval(query, *insert_data.values())
 
-async def upsert_entity(conn, entity: EntityInput, fallback_category: str, fallback_risk: float) -> int:
+async def upsert_entity(conn: asyncpg.Connection, entity: EntityInput, fallback_category: str, fallback_risk: float) -> int:
     normalized = normalize_entity_value(entity.entity_type, entity.value)
     value_hash = hash_value(normalized)
-    sensitive = entity.entity_type in {"PHONE", "EMAIL", "BANK_CARD", "IBAN", "WALLET", "ADDRESS"}
+    sensitive = entity.entity_type in SENSITIVE_ENTITY_TYPES
     encrypted = encrypt_value(entity.value) if sensitive else None
     display = mask_value(entity.entity_type, normalized) if sensitive else entity.value.strip()
-    city = entity.city or infer_city(entity.value, json.dumps(entity.metadata))
-    category = entity.category or fallback_category
+    city = entity.city or infer_city(entity.value, safe_json(entity.metadata))
+    category = normalize_category(entity.category) if entity.category else fallback_category
     risk = entity.risk_score if entity.risk_score is not None else fallback_risk
 
     return await conn.fetchval(
         """
-        INSERT INTO entities(entity_type, display_value, normalized_value, value_hash, encrypted_value,
-            risk_score, category, country, city, metadata, last_seen)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,now())
+        INSERT INTO entities(
+            entity_type, display_value, normalized_value, value_hash, encrypted_value,
+            risk_score, category, country, city, metadata, last_seen
+        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,now())
         ON CONFLICT(entity_type, value_hash) DO UPDATE SET
             display_value = EXCLUDED.display_value,
             encrypted_value = COALESCE(EXCLUDED.encrypted_value, entities.encrypted_value),
@@ -537,25 +833,48 @@ async def upsert_entity(conn, entity: EntityInput, fallback_category: str, fallb
         RETURNING id
         """,
         entity.entity_type, display, normalized, value_hash, encrypted,
-        risk, category, entity.country, city,
-        json.dumps(entity.metadata, ensure_ascii=False),
+        risk, category, entity.country, city, safe_json(entity.metadata),
     )
 
-# ---------- ОСНОВНАЯ ЛОГИКА СОХРАНЕНИЯ ----------
+async def upsert_tags(conn: asyncpg.Connection, post_id: int, tag_names: List[str]) -> None:
+    for raw in tag_names:
+        name = (raw or "").strip()
+        if not name or len(name) > 200:
+            continue
+        tag_id = await conn.fetchval(
+            "INSERT INTO tags(name) VALUES($1) ON CONFLICT(name) DO UPDATE SET name = EXCLUDED.name RETURNING id",
+            name,
+        )
+        await conn.execute(
+            "INSERT INTO post_tags(post_id, tag_id) VALUES($1,$2) ON CONFLICT DO NOTHING",
+            post_id, tag_id,
+        )
+
+# ============================================================
+# ОСНОВНАЯ ФУНКЦИЯ СОХРАНЕНИЯ
+# ============================================================
 async def save_ingest(ev: IngestRequest) -> dict:
     assert pool is not None
     payload_hash = hash_value(ev.model_dump_json())
-    entity_ids: Dict[str, int] = {}
+    entity_ids: dict[str, int] = {}
 
-    # Анализ текста
-    text = (ev.title or "") + " " + (ev.text or "")
-    flags = detect_red_flags(text)
-    risk_boost = compute_risk_boost(flags)
-    if risk_boost > 0:
-        ev.risk_score = min(ev.risk_score + risk_boost, 1.0)
-        ev.red_flags = list(set(ev.red_flags + flags))
+    await ensure_category_exists(ev.category)
+
+    text_to_scan = (ev.title or "") + " " + (ev.text or "")
+    flags_from_text = detect_red_flags(text_to_scan)
+    risk_boost = compute_risk_boost(flags_from_text)
+    all_flags = list(set(ev.red_flags + flags_from_text))
+    adjusted_risk = min(ev.risk_score + risk_boost, 1.0)
+    if adjusted_risk > ev.risk_score:
+        ev.risk_score = adjusted_risk
+        ev.red_flags = all_flags
         if not ev.explanation:
-            ev.explanation = "Обнаружены характерные признаки мошенничества."
+            ev.explanation = "Обнаружены характерные признаки мошеннической/незаконной схемы."
+
+    if ev.category == "CLEAN" and ev.risk_score >= RISK_THRESHOLD_MEDIUM:
+        ev.category = "SUSPICIOUS"
+    if ev.category == "SUSPICIOUS" and ev.risk_score >= RISK_THRESHOLD_HIGH:
+        ev.category = "OTHER_SCAM"
 
     if not ev.keywords and ev.text:
         ev.keywords = extract_keywords(ev.text)
@@ -567,11 +886,14 @@ async def save_ingest(ev: IngestRequest) -> dict:
                 source_id = await upsert_source(conn, project_id, ev)
                 post_id = await upsert_post(conn, source_id, ev)
 
-                # Сущности
+                if ev.tags:
+                    await upsert_tags(conn, post_id, ev.tags)
+
                 for idx, entity in enumerate(ev.entities):
                     entity_id = await upsert_entity(conn, entity, ev.category, ev.risk_score)
                     ref = f"e{idx}"
                     entity_ids[ref] = entity_id
+                    entity_ids[f"{entity.entity_type}:{normalize_entity_value(entity.entity_type, entity.value)}"] = entity_id
                     await conn.execute(
                         """
                         INSERT INTO post_entities(post_id, entity_id, role, confidence, excerpt)
@@ -583,17 +905,18 @@ async def save_ingest(ev: IngestRequest) -> dict:
                         post_id, entity_id, entity.role, entity.confidence, entity.excerpt,
                     )
 
-                # Связи
-                for rel in ev.relations:
-                    src_id = entity_ids.get(rel.source_ref)
-                    tgt_id = entity_ids.get(rel.target_ref)
+                for relation in ev.relations:
+                    src_id = entity_ids.get(relation.source_ref)
+                    tgt_id = entity_ids.get(relation.target_ref)
                     if not src_id or not tgt_id:
-                        raise HTTPException(422, f"Неизвестная сущность: {rel.source_ref} -> {rel.target_ref}")
+                        logger.warning(f"Пропущена связь: неизвестная сущность {relation.source_ref} -> {relation.target_ref}")
+                        continue
                     await conn.execute(
                         """
-                        INSERT INTO relations(source_entity_id, target_entity_id, relation_type,
-                            confidence, risk_score, evidence_post_id, description, metadata, last_seen)
-                        VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,now())
+                        INSERT INTO relations(
+                            source_entity_id, target_entity_id, relation_type,
+                            confidence, risk_score, evidence_post_id, description, metadata, last_seen
+                        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,now())
                         ON CONFLICT(source_entity_id, target_entity_id, relation_type, evidence_post_id)
                         DO UPDATE SET
                             confidence = GREATEST(relations.confidence, EXCLUDED.confidence),
@@ -602,55 +925,53 @@ async def save_ingest(ev: IngestRequest) -> dict:
                             metadata = relations.metadata || EXCLUDED.metadata,
                             last_seen = now()
                         """,
-                        src_id, tgt_id, rel.relation_type.upper(),
-                        rel.confidence, rel.risk_score, post_id, rel.description,
-                        json.dumps(rel.metadata, ensure_ascii=False),
+                        src_id, tgt_id, relation.relation_type.upper(),
+                        relation.confidence, relation.risk_score, post_id, relation.description,
+                        safe_json(relation.metadata),
                     )
 
-                # Улики
-                for evidence in ev.evidence:
-                    entity_id = entity_ids.get(evidence.entity_ref) if evidence.entity_ref else None
+                for evd in ev.evidence:
+                    entity_id = entity_ids.get(evd.entity_ref) if evd.entity_ref else None
                     await conn.execute(
                         """
-                        INSERT INTO evidence(post_id, entity_id, evidence_type, storage_url, original_url,
-                            sha256, mime_type, captured_at, captured_by, metadata)
-                        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)
+                        INSERT INTO evidence(
+                            post_id, entity_id, evidence_type, storage_url, original_url,
+                            sha256, mime_type, captured_at, captured_by, metadata
+                        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)
                         """,
-                        post_id, entity_id, evidence.evidence_type, evidence.storage_url,
-                        evidence.original_url, evidence.sha256, evidence.mime_type,
-                        parse_dt(evidence.captured_at) or utcnow(), evidence.captured_by,
-                        json.dumps(evidence.metadata, ensure_ascii=False),
+                        post_id, entity_id, evd.evidence_type, evd.storage_url,
+                        evd.original_url, evd.sha256, evd.mime_type,
+                        parse_dt(evd.captured_at) or utcnow(), evd.captured_by,
+                        safe_json(evd.metadata),
                     )
 
-                # Алерт (всегда, если не CLEAN)
                 if ev.category != "CLEAN":
+                    severity = severity_for(ev.risk_score)
                     await conn.execute(
                         """
                         INSERT INTO alerts(project_id, source_id, post_id, alert_type, severity, title, message, risk_score)
-                        VALUES($1,$2,$3,'SUSPICIOUS_CONTENT',$4,$5,$6,$7)
+                        VALUES($1,$2,$3,'NEW_DETECTION',$4,$5,$6,$7)
                         """,
-                        project_id, source_id, post_id, severity_for(ev.risk_score),
-                        f"Обнаружен риск: {ev.category}",
-                        ev.title or ev.text or ev.source_name,
+                        project_id, source_id, post_id, severity,
+                        f"{ev.category}: {ev.title or ev.source_name}",
+                        ev.explanation or ev.title or ev.text or ev.source_name,
                         ev.risk_score,
                     )
 
                 await conn.execute(
-                    """
-                    INSERT INTO ingest_events(request_id, source_type, payload_hash, status)
-                    VALUES($1,$2,$3,'SUCCESS')
-                    """,
+                    "INSERT INTO ingest_events(request_id, source_type, payload_hash, status) VALUES($1,$2,$3,'SUCCESS')",
                     ev.request_id, ev.source_type, payload_hash,
                 )
 
-        # Telegram – отправляем всегда, если категория != CLEAN
-        if ev.category != "CLEAN" and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        # Telegram уходит по каждой новой находке (кроме CLEAN), см. ALERT_MIN_RISK
+        if ev.category != "CLEAN" and ev.risk_score >= ALERT_MIN_RISK:
             evidence_urls = [e.storage_url for e in ev.evidence if e.storage_url]
             await send_telegram_alert(
                 title=ev.title or ev.text or ev.source_name,
                 category=ev.category,
                 risk_score=ev.risk_score,
                 source_name=ev.source_name,
+                source_type=ev.source_type,
                 post_url=ev.item_url,
                 evidence_urls=evidence_urls,
             )
@@ -660,10 +981,14 @@ async def save_ingest(ev: IngestRequest) -> dict:
             "project": ev.project,
             "source_id": source_id,
             "post_id": post_id,
+            "category": ev.category,
+            "risk_score": ev.risk_score,
             "entities_saved": len(ev.entities),
             "relations_saved": len(ev.relations),
             "evidence_saved": len(ev.evidence),
+            "tags_saved": len(ev.tags),
             "risk_adjusted": risk_boost > 0,
+            "detected_red_flags": all_flags,
         }
     except HTTPException:
         raise
@@ -672,144 +997,199 @@ async def save_ingest(ev: IngestRequest) -> dict:
         try:
             async with pool.acquire() as conn:
                 await conn.execute(
-                    """
-                    INSERT INTO ingest_events(request_id, source_type, payload_hash, status, error)
-                    VALUES($1,$2,$3,'ERROR',$4)
-                    """,
+                    "INSERT INTO ingest_events(request_id, source_type, payload_hash, status, error) VALUES($1,$2,$3,'ERROR',$4)",
                     ev.request_id, ev.source_type, payload_hash, str(e)[:2000],
                 )
-        except:
-            pass
-        raise HTTPException(500, detail="Ошибка сохранения данных")
+        except Exception:
+            logger.exception("Не удалось записать ошибку ингеста в журнал")
+        # Никогда не роняем сервер целиком — но сообщаем клиенту о неудаче
+        raise HTTPException(500, detail=f"Ошибка сохранения данных: {e}")
 
-# ---------- ЭНДПОИНТЫ ----------
+# ============================================================
+# ЭНДПОИНТЫ — СЛУЖЕБНЫЕ
+# ============================================================
 @app.get("/health")
-async def health():
+async def health() -> dict:
     try:
+        assert pool is not None
         async with pool.acquire() as conn:
             await conn.fetchval("SELECT 1")
-        return {"status": "ok", "database": "ok", "time": utcnow().isoformat()}
+        return {"status": "ok", "service": "SERPYN", "database": "ok", "time": utcnow().isoformat()}
     except Exception as e:
-        return {"status": "degraded", "database": "error", "error": str(e)}
+        logger.exception("Health check failed")
+        return {"status": "degraded", "service": "SERPYN", "database": "error", "error": str(e)}
 
+@app.get("/")
+async def root() -> dict:
+    return {
+        "service": "SERPYN 2.0 — Анти-скам платформа",
+        "version": "2.0.0",
+        "docs": "/docs",
+        "health": "/health",
+        "endpoints": {
+            "ingest": ["POST /ingest", "POST /ingest/youtube", "POST /upload_screenshot", "POST /evidence"],
+            "categories": ["GET /categories", "POST /categories"],
+            "tags": ["GET /tags"],
+            "read": [
+                "GET /channels", "GET /suspicious", "GET /graph", "GET /stats", "GET /map",
+                "GET /alerts", "PATCH /alerts/{id}/read", "GET /wallets", "GET /sources/stats",
+                "GET /trend", "GET /entity/{id}/dossier", "GET /channel/{id}/dossier",
+                "GET /wallet/{address}",
+            ],
+        },
+    }
+
+# ============================================================
+# ЭНДПОИНТЫ — ПРИЁМ ДАННЫХ
+# ============================================================
 @app.post("/ingest")
-async def ingest(ev: IngestRequest, request: Request):
+async def ingest(ev: IngestRequest, request: Request) -> dict:
     require_ingest_token(request.headers.get("X-Ingest-Token"))
     return await save_ingest(ev)
 
 @app.post("/ingest/youtube")
-async def ingest_youtube(payload: Dict[str, Any], request: Request):
+async def ingest_youtube(payload: YouTubeHunterPayload, request: Request) -> dict:
     require_ingest_token(request.headers.get("X-Ingest-Token"))
-    # Совместимость с существующим парсером (адаптируем)
-    # Если приходит старый формат с ads – обрабатываем
-    saved = 0
-    if "ads" in payload:
-        for ad in payload["ads"]:
-            try:
-                # Преобразуем в IngestRequest
-                item_id = ad.get("search_keyword", "").split("v=")[-1][:11]
-                if not item_id:
-                    item_id = ad.get("transparency_url", "").split("v=")[-1][:11]
-                if not item_id:
-                    item_id = f"yt_{hash(ad.get('ad_text',''))}"
-                # Определяем source_type по ссылке
-                url = ad.get("transparency_url") or ad.get("search_keyword", "")
-                if "youtube" in url or "youtu.be" in url:
-                    source_type = "YOUTUBE"
-                elif "t.me" in url or "telegram" in url:
-                    source_type = "TELEGRAM"
-                elif "instagram" in url:
-                    source_type = "INSTAGRAM"
-                elif "tiktok" in url:
-                    source_type = "TIKTOK"
-                else:
-                    source_type = "OTHER"
+    saved, failed = 0, 0
 
-                cat_map = {"dangerous": "PYRAMID", "suspicious": "LIKELY_PYRAMID", "safe": "CLEAN"}
-                category = cat_map.get(ad.get("verdict", "").lower(), "UNKNOWN")
-                risk = min(ad.get("risk_score", 50) / 100.0, 1.0)
+    def detect_source_type(url: str) -> str:
+        if not url:
+            return "OTHER"
+        u = url.lower()
+        if "youtube.com" in u or "youtu.be" in u:
+            return "YOUTUBE"
+        if "t.me" in u or "telegram" in u:
+            return "TELEGRAM"
+        if "instagram.com" in u:
+            return "INSTAGRAM"
+        if "tiktok.com" in u:
+            return "TIKTOK"
+        if "threads.net" in u:
+            return "THREADS"
+        if "facebook.com" in u or "fb.com" in u:
+            return "FACEBOOK"
+        if "vk.com" in u:
+            return "VK"
+        return "OTHER"
 
-                extra = {k:v for k,v in ad.items() if k not in ["advertiser_name","advertiser_domain","ad_text","search_keyword","screenshot_url","transparency_url","scraped_at","risk_score","verdict","risk_flags","ai_reason"]}
-                extra["scraped_at"] = ad.get("scraped_at")
-                extra["verdict"] = ad.get("verdict")
-                extra["scheme_type"] = ad.get("scheme_type")
-                extra["license_check"] = ad.get("license_check")
-                extra["advice_for_pensioner"] = ad.get("advice_for_pensioner")
+    for ad in payload.ads:
+        try:
+            video_id = None
+            m = re.search(r"v=([a-zA-Z0-9_-]{11})", ad.search_keyword or "")
+            if m:
+                video_id = m.group(1)
+            else:
+                m = re.search(r"v=([a-zA-Z0-9_-]{11})", ad.transparency_url or "")
+                if m:
+                    video_id = m.group(1)
+            if not video_id:
+                video_id = stable_item_id(ad.transparency_url, ad.ad_text, ad.advertiser_name)
 
-                evidence = []
-                if ad.get("screenshot_url"):
-                    evidence.append(EvidenceInput(
-                        evidence_type="SCREENSHOT",
-                        storage_url=ad["screenshot_url"],
-                        original_url=ad.get("transparency_url"),
-                        captured_at=ad.get("scraped_at"),
-                        captured_by="youtube_hunter",
-                    ))
+            verdict_map = {"dangerous": "OTHER_SCAM", "suspicious": "SUSPICIOUS", "safe": "CLEAN"}
+            category = verdict_map.get((ad.verdict or "").lower(), "UNKNOWN")
+            risk_norm = min(max(ad.risk_score, 0) / 100.0, 1.0)
 
-                entities = []
-                if ad.get("advertiser_domain"):
-                    entities.append(EntityInput(
-                        entity_type="DOMAIN",
-                        value=ad["advertiser_domain"],
-                        role="advertiser_domain",
-                        confidence=0.9,
-                        risk_score=risk,
-                        category=category,
-                    ))
+            extra = ad.model_dump(exclude={"screenshot_path", "screenshot_url"})
+            extra["arrfr_check"] = ad.arrfr_check.model_dump()
+            extra["domain_risk"] = ad.domain_risk.model_dump()
 
-                req = IngestRequest(
-                    request_id=f"yt_{payload.get('run_timestamp', datetime.now().isoformat())}",
-                    project=payload.get("project", "serpin-youtube"),
-                    source_type=source_type,
-                    source_name=ad.get("advertiser_name", "YouTube Ad"),
-                    source_external_id=item_id,
-                    source_url=ad.get("transparency_url"),
-                    item_id=item_id,
-                    item_url=ad.get("transparency_url"),
-                    title=ad.get("ad_title") or ad.get("ad_text", "")[:100],
-                    text=ad.get("ad_text", ""),
-                    published_at=ad.get("scraped_at"),
-                    category=category,
-                    risk_score=risk,
-                    confidence=0.8,
-                    explanation=ad.get("ai_reason", ""),
-                    red_flags=ad.get("risk_flags", []),
-                    extra=extra,
-                    entities=entities,
-                    evidence=evidence,
-                )
-                await save_ingest(req)
-                saved += 1
-            except Exception as e:
-                logger.error(f"Ошибка сохранения рекламы: {e}")
-        return {"status": "success", "saved": saved, "total": len(payload.get("ads", []))}
-    else:
-        # Если пришёл одиночный объект
-        return await save_ingest(IngestRequest(**payload))
+            entities = []
+            if ad.advertiser_domain:
+                entities.append(EntityInput(
+                    entity_type="DOMAIN", value=ad.advertiser_domain, role="advertiser_domain",
+                    confidence=0.9, risk_score=risk_norm, category=category,
+                    metadata={"source": "youtube_hunter"},
+                ))
+
+            evidence = []
+            if ad.screenshot_url:
+                evidence.append(EvidenceInput(
+                    evidence_type="SCREENSHOT", storage_url=ad.screenshot_url,
+                    original_url=ad.transparency_url, captured_at=ad.scraped_at,
+                    captured_by="youtube_hunter", metadata={"verdict": ad.verdict},
+                ))
+            elif ad.screenshot_path:
+                logger.warning(f"Скриншот не загружен в облако: {ad.screenshot_path}")
+
+            real_source_type = detect_source_type(ad.transparency_url or ad.search_keyword)
+            source_external_id = ad.advertiser_domain or video_id
+            if real_source_type == "TELEGRAM" and ad.transparency_url:
+                tg_match = re.search(r"t\.me/([a-zA-Z0-9_]+|\+[a-zA-Z0-9_]+)", ad.transparency_url)
+                if tg_match:
+                    source_external_id = tg_match.group(1)
+            source_name = ad.advertiser_name or "YouTube Ad"
+
+            ingest_req = IngestRequest(
+                request_id=f"yt_{payload.run_timestamp}",
+                project=payload.project,
+                source_type=real_source_type,
+                source_name=source_name,
+                source_external_id=source_external_id,
+                source_url=ad.transparency_url,
+                source_country="KZ",
+                item_id=video_id,
+                item_url=ad.transparency_url or ad.search_keyword,
+                title=ad.ad_title or (ad.ad_text[:100] if ad.ad_text else "YouTube ad"),
+                text=ad.ad_text,
+                normalized_text=ad.ad_text,
+                published_at=ad.scraped_at,
+                category=category,
+                risk_score=risk_norm,
+                confidence=0.8,
+                explanation=ad.ai_reason,
+                red_flags=ad.risk_flags,
+                keywords=[],
+                model=ad.analyzed_by,
+                extra=extra,
+                entities=entities,
+                relations=[],
+                evidence=evidence,
+            )
+            await save_ingest(ingest_req)
+            saved += 1
+        except Exception as e:
+            failed += 1
+            logger.error(f"Ошибка сохранения объявления: {e}")
+
+    return {"status": "success", "saved": saved, "failed": failed, "total": len(payload.ads)}
+
+class UploadScreenshotRequest(BaseModel):
+    file_name: str = "screenshot.png"
+    file_data: str  # data:image/png;base64,... либо чистый base64
+    folder: str = "evidence"
 
 @app.post("/upload_screenshot")
-async def upload_screenshot(req: UploadScreenshotRequest, request: Request):
+async def upload_screenshot(req: UploadScreenshotRequest, request: Request) -> dict:
     require_ingest_token(request.headers.get("X-Ingest-Token"))
     if not supabase_client:
-        raise HTTPException(503, "Supabase не настроен на сервере")
+        raise HTTPException(503, "Supabase Storage не настроен на сервере (SUPABASE_URL / SUPABASE_SERVICE_KEY)")
 
-    if req.file_data.startswith("data:"):
-        b64 = req.file_data.split(",", 1)[1]
-    else:
-        b64 = req.file_data
-    file_bytes = base64.b64decode(b64)
+    try:
+        raw = req.file_data.split(",", 1)[1] if req.file_data.startswith("data:") else req.file_data
+        file_bytes = base64.b64decode(raw)
+    except Exception as e:
+        raise HTTPException(400, f"Некорректные base64-данные: {e}")
 
-    ext = req.file_name.split(".")[-1] if "." in req.file_name else "png"
+    ext = req.file_name.rsplit(".", 1)[-1].lower() if "." in req.file_name else "png"
+    if not re.match(r"^[a-z0-9]{1,10}$", ext):
+        ext = "png"
     unique_name = f"{uuid.uuid4()}.{ext}"
+    content_type = {
+        "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+        "webp": "image/webp", "pdf": "application/pdf", "html": "text/html",
+        "mp4": "video/mp4",
+    }.get(ext, "application/octet-stream")
 
-    res = supabase_client.storage.from_(req.folder).upload(
-        unique_name, file_bytes, {"content-type": "image/png"}
-    )
-    if res.status_code != 200:
-        raise HTTPException(500, f"Ошибка загрузки: {res.text}")
+    try:
+        folder = re.sub(r"[^a-zA-Z0-9_-]", "", req.folder) or "evidence"
+        supabase_client.storage.from_(folder).upload(
+            unique_name, file_bytes, {"content-type": content_type}
+        )
+        public_url = supabase_client.storage.from_(folder).get_public_url(unique_name)
+    except Exception as e:
+        raise HTTPException(500, f"Ошибка загрузки в Supabase Storage: {e}")
 
-    public_url = supabase_client.storage.from_(req.folder).get_public_url(unique_name)
-    return {"url": public_url}
+    return {"status": "success", "url": public_url, "file_name": unique_name}
 
 @app.post("/evidence")
 async def add_evidence(
@@ -823,7 +1203,7 @@ async def add_evidence(
     captured_at: Optional[str] = None,
     captured_by: Optional[str] = None,
     request: Request = None,
-):
+) -> dict:
     require_ingest_token(request.headers.get("X-Ingest-Token"))
     assert pool is not None
     async with pool.acquire() as conn:
@@ -835,96 +1215,438 @@ async def add_evidence(
             exists = await conn.fetchval("SELECT 1 FROM entities WHERE id = $1", entity_id)
             if not exists:
                 raise HTTPException(404, "Сущность не найдена")
-        evid = await conn.fetchval(
+        evidence_id = await conn.fetchval(
             """
             INSERT INTO evidence(post_id, entity_id, evidence_type, storage_url, original_url,
-                sha256, mime_type, captured_at, captured_by)
+                                  sha256, mime_type, captured_at, captured_by)
             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id
             """,
-            post_id, entity_id, evidence_type, storage_url, original_url,
+            post_id, entity_id, normalize_evidence_type(evidence_type), storage_url, original_url,
             sha256, mime_type, parse_dt(captured_at) or utcnow(), captured_by,
         )
-    return {"status": "success", "evidence_id": evid}
+    return {"status": "success", "evidence_id": evidence_id}
 
-# ---------- ЭНДПОИНТЫ ДЛЯ КАТЕГОРИЙ И ТЕГОВ ----------
+# ============================================================
+# ЭНДПОИНТЫ — ДИНАМИЧЕСКИЕ КАТЕГОРИИ И ТЕГИ
+# ============================================================
 @app.get("/categories")
-async def list_categories(lang: str = "ru"):
+async def list_categories(group: Optional[str] = None) -> list[dict]:
     assert pool is not None
     async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT * FROM categories ORDER BY id")
-        result = []
-        for r in rows:
-            label = r.get(f"label_{lang}") or r["label_ru"]
-            result.append({
-                "id": r["id"],
-                "name": r["name"],
-                "label": label,
-                "description": r["description"],
-                "risk_default": r["risk_default"],
-                "is_illegal": r["is_illegal"],
-                "icon": r["icon"],
-                "color": r["color"],
-            })
-        return result
+        if group:
+            rows = await conn.fetch(
+                "SELECT * FROM categories WHERE is_active = true AND category_group = $1 ORDER BY code",
+                group.upper(),
+            )
+        else:
+            rows = await conn.fetch("SELECT * FROM categories WHERE is_active = true ORDER BY category_group, code")
+        return [dict(r) for r in rows]
 
 @app.post("/categories")
-async def create_category(cat: CategoryCreate, request: Request):
+async def create_category(cat: CategoryInput, request: Request) -> dict:
     require_ingest_token(request.headers.get("X-Ingest-Token"))
+    code = re.sub(r"[^A-Za-z0-9_]+", "_", cat.code.upper()).strip("_")
+    if not code:
+        raise HTTPException(422, "Некорректный код категории")
     assert pool is not None
     async with pool.acquire() as conn:
-        await conn.execute(
+        row = await conn.fetchrow(
             """
-            INSERT INTO categories(name, label_ru, label_kk, label_en, description,
-                risk_default, is_illegal, icon, color)
+            INSERT INTO categories(code, category_group, name_ru, name_kk, name_en,
+                                    description_ru, description_kk, description_en, default_severity)
             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
-            ON CONFLICT(name) DO NOTHING
+            ON CONFLICT(code) DO UPDATE SET
+                category_group = EXCLUDED.category_group,
+                name_ru = COALESCE(EXCLUDED.name_ru, categories.name_ru),
+                name_kk = COALESCE(EXCLUDED.name_kk, categories.name_kk),
+                name_en = COALESCE(EXCLUDED.name_en, categories.name_en),
+                description_ru = COALESCE(EXCLUDED.description_ru, categories.description_ru),
+                description_kk = COALESCE(EXCLUDED.description_kk, categories.description_kk),
+                description_en = COALESCE(EXCLUDED.description_en, categories.description_en),
+                default_severity = EXCLUDED.default_severity,
+                is_active = true,
+                updated_at = now()
+            RETURNING *
             """,
-            cat.name, cat.label_ru, cat.label_kk, cat.label_en,
-            cat.description, cat.risk_default, cat.is_illegal, cat.icon, cat.color,
+            code, cat.category_group.upper(), cat.name_ru, cat.name_kk, cat.name_en,
+            cat.description_ru, cat.description_kk, cat.description_en, cat.default_severity.upper(),
         )
-    return {"status": "created", "name": cat.name}
+    CATEGORY_CACHE[code] = dict(row)
+    return {"status": "success", "category": dict(row)}
 
 @app.get("/tags")
-async def list_tags(lang: str = "ru"):
+async def list_tags(limit: int = Query(200, ge=1, le=2000)) -> list[dict]:
     assert pool is not None
     async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT * FROM tags ORDER BY id")
-        result = []
-        for r in rows:
-            label = r.get(f"label_{lang}") or r["label_ru"]
-            result.append({
-                "id": r["id"],
-                "name": r["name"],
-                "label": label,
-                "color": r["color"],
-            })
-        return result
+        rows = await conn.fetch(
+            """
+            SELECT t.id, t.name, COUNT(pt.post_id) AS usage_count
+            FROM tags t LEFT JOIN post_tags pt ON pt.tag_id = t.id
+            GROUP BY t.id ORDER BY usage_count DESC LIMIT $1
+            """,
+            limit,
+        )
+        return [dict(r) for r in rows]
 
-@app.post("/tags")
-async def create_tag(tag: TagCreate, request: Request):
+# ============================================================
+# ЭНДПОИНТЫ — ЧТЕНИЕ ДАННЫХ
+# ============================================================
+@app.get("/wallets")
+async def list_wallets(min_risk: float = Query(0.0, ge=0, le=1), limit: int = Query(50, ge=1, le=500)) -> list[dict]:
+    assert pool is not None
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT e.id, e.entity_type, e.display_value, e.risk_score, e.category,
+                   e.city, e.first_seen, e.last_seen, e.metadata,
+                   COUNT(DISTINCT pe.post_id) AS mention_count
+            FROM entities e
+            LEFT JOIN post_entities pe ON pe.entity_id = e.id
+            WHERE e.entity_type = 'WALLET' AND e.risk_score >= $1
+            GROUP BY e.id ORDER BY e.risk_score DESC, mention_count DESC LIMIT $2
+            """,
+            min_risk, limit,
+        )
+        return [dict(r) for r in rows]
+
+@app.get("/sources/stats")
+async def sources_stats() -> list[dict]:
+    assert pool is not None
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT s.source_type, COUNT(DISTINCT s.id) AS sources, COUNT(p.id) AS posts,
+                   COUNT(p.id) FILTER(WHERE p.category <> 'CLEAN' AND p.risk_score >= 0.5) AS suspicious
+            FROM sources s LEFT JOIN posts p ON p.source_id = s.id
+            GROUP BY s.source_type ORDER BY suspicious DESC, posts DESC
+            """
+        )
+        return [dict(r) for r in rows]
+
+@app.get("/trend")
+async def trend(days: int = Query(30, ge=1, le=365)) -> list[dict]:
+    assert pool is not None
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT DATE_TRUNC('day', published_at) AS date, COUNT(*) AS total,
+                   COUNT(*) FILTER(WHERE category <> 'CLEAN' AND risk_score >= 0.5) AS suspicious
+            FROM posts WHERE published_at >= NOW() - INTERVAL '1 day' * $1
+            GROUP BY DATE_TRUNC('day', published_at) ORDER BY date DESC
+            """,
+            days,
+        )
+        return [{"date": r["date"].isoformat() if r["date"] else None, "total": r["total"], "suspicious": r["suspicious"]} for r in rows]
+
+@app.get("/channels")
+async def channels(source_type: Optional[str] = None, limit: int = Query(100, ge=1, le=1000)) -> list[dict]:
+    assert pool is not None
+    params: list = []
+    where = ""
+    if source_type:
+        params.append(normalize_source_type(source_type))
+        where = "WHERE s.source_type = $1"
+    params.append(limit)
+    limit_idx = len(params)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT s.id, s.project_id, s.source_type, s.name, s.external_id, s.username,
+                   s.url, s.city, s.country, s.first_seen, s.last_seen,
+                   s.risk_score, s.category, s.is_active,
+                   COUNT(p.id) AS posts_count,
+                   COUNT(p.id) FILTER(WHERE p.category <> 'CLEAN' AND p.risk_score >= 0.5) AS suspicious_count,
+                   MAX(p.risk_score) AS max_post_risk
+            FROM sources s LEFT JOIN posts p ON p.source_id = s.id
+            {where}
+            GROUP BY s.id ORDER BY suspicious_count DESC, s.risk_score DESC LIMIT ${limit_idx}
+            """,
+            *params,
+        )
+        return [dict(r) for r in rows]
+
+@app.get("/suspicious")
+async def suspicious(
+    category: Optional[str] = None,
+    source_type: Optional[str] = None,
+    min_risk: float = Query(0.5, ge=0, le=1),
+    city: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    language: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> list[dict]:
+    assert pool is not None
+    clauses = ["p.category <> 'CLEAN'", "p.risk_score >= $1"]
+    params: list = [min_risk]
+
+    def add_clause(sql: str, val: Any) -> None:
+        params.append(val)
+        clauses.append(sql.replace("?", f"${len(params)}"))
+
+    if category:
+        add_clause("p.category = ?", normalize_category(category))
+    if source_type:
+        add_clause("s.source_type = ?", normalize_source_type(source_type))
+    if city:
+        add_clause("s.city = ?", city)
+    if language:
+        add_clause("p.language = ?", language)
+    if parse_dt(date_from):
+        add_clause("p.published_at >= ?", parse_dt(date_from))
+    if parse_dt(date_to):
+        add_clause("p.published_at <= ?", parse_dt(date_to))
+
+    params.extend([limit, offset])
+    limit_idx, offset_idx = len(params) - 1, len(params)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT p.id, p.external_id, p.url, p.title, p.author, p.published_at,
+                   p.raw_text, p.category, p.risk_score, p.confidence,
+                   p.explanation, p.red_flags, p.keywords, p.created_at,
+                   s.id AS source_id, s.name AS source_name, s.source_type,
+                   s.username AS source_username, s.url AS source_url, s.city
+            FROM posts p JOIN sources s ON s.id = p.source_id
+            WHERE {' AND '.join(clauses)}
+            ORDER BY p.risk_score DESC, p.published_at DESC NULLS LAST
+            LIMIT ${limit_idx} OFFSET ${offset_idx}
+            """,
+            *params,
+        )
+        return [dict(r) for r in rows]
+
+async def fetch_entity_dossier(conn: asyncpg.Connection, entity_id: int, reveal: bool) -> dict:
+    entity = await conn.fetchrow("SELECT * FROM entities WHERE id = $1", entity_id)
+    if not entity:
+        raise HTTPException(404, "Сущность не найдена")
+    entity_dict = dict(entity)
+    if reveal and entity_dict["encrypted_value"]:
+        entity_dict["value"] = decrypt_value(entity_dict["encrypted_value"])
+    else:
+        entity_dict["value"] = entity_dict["display_value"]
+    entity_dict.pop("encrypted_value", None)
+    entity_dict.pop("normalized_value", None)
+    entity_dict.pop("value_hash", None)
+
+    posts = await conn.fetch(
+        """
+        SELECT p.id, p.title, p.url, p.published_at, p.category, p.risk_score,
+               p.explanation, pe.role, pe.confidence, pe.excerpt,
+               s.name AS source_name, s.source_type
+        FROM post_entities pe JOIN posts p ON p.id = pe.post_id JOIN sources s ON s.id = p.source_id
+        WHERE pe.entity_id = $1 ORDER BY p.risk_score DESC, p.published_at DESC NULLS LAST LIMIT 100
+        """,
+        entity_id,
+    )
+    relations = await conn.fetch(
+        """
+        SELECT r.id, r.relation_type, r.confidence, r.risk_score, r.description, r.first_seen, r.last_seen,
+               CASE WHEN r.source_entity_id = $1 THEN 'OUT' ELSE 'IN' END AS direction,
+               CASE WHEN r.source_entity_id = $1 THEN t.id ELSE s.id END AS related_id,
+               CASE WHEN r.source_entity_id = $1 THEN t.entity_type ELSE s.entity_type END AS related_type,
+               CASE WHEN r.source_entity_id = $1 THEN t.display_value ELSE s.display_value END AS related_value
+        FROM relations r JOIN entities s ON s.id = r.source_entity_id JOIN entities t ON t.id = r.target_entity_id
+        WHERE r.source_entity_id = $1 OR r.target_entity_id = $1
+        ORDER BY r.risk_score DESC, r.last_seen DESC
+        """,
+        entity_id,
+    )
+    evidence = await conn.fetch("SELECT * FROM evidence WHERE entity_id = $1 ORDER BY captured_at DESC", entity_id)
+    return {
+        "entity": entity_dict,
+        "posts": [dict(x) for x in posts],
+        "relations": [dict(x) for x in relations],
+        "evidence": [dict(x) for x in evidence],
+    }
+
+@app.get("/entity/{entity_id}/dossier")
+async def entity_dossier(entity_id: int, request: Request, reveal: bool = False) -> dict:
+    if reveal:
+        require_ingest_token(request.headers.get("X-Ingest-Token"))
+    assert pool is not None
+    async with pool.acquire() as conn:
+        return await fetch_entity_dossier(conn, entity_id, reveal)
+
+@app.get("/channel/{source_id}/dossier")
+async def channel_dossier(source_id: int) -> dict:
+    assert pool is not None
+    async with pool.acquire() as conn:
+        source = await conn.fetchrow("SELECT * FROM sources WHERE id = $1", source_id)
+        if not source:
+            raise HTTPException(404, "Источник не найден")
+        stats = await conn.fetchrow(
+            """
+            SELECT COUNT(*) AS posts_total,
+                   COUNT(*) FILTER(WHERE category <> 'CLEAN' AND risk_score >= 0.5) AS suspicious_total,
+                   AVG(risk_score) AS avg_risk, MAX(risk_score) AS max_risk
+            FROM posts WHERE source_id = $1
+            """,
+            source_id,
+        )
+        posts = await conn.fetch(
+            """
+            SELECT id, external_id, url, title, author, published_at, raw_text,
+                   category, risk_score, confidence, explanation, red_flags, keywords
+            FROM posts WHERE source_id = $1
+            ORDER BY risk_score DESC, published_at DESC NULLS LAST LIMIT 100
+            """,
+            source_id,
+        )
+        entities = await conn.fetch(
+            """
+            SELECT DISTINCT e.id, e.entity_type, e.display_value, e.risk_score,
+                   e.category, e.city, e.first_seen, e.last_seen
+            FROM entities e JOIN post_entities pe ON pe.entity_id = e.id JOIN posts p ON p.id = pe.post_id
+            WHERE p.source_id = $1 ORDER BY e.risk_score DESC
+            """,
+            source_id,
+        )
+        evidence = await conn.fetch(
+            """
+            SELECT ev.* FROM evidence ev JOIN posts p ON p.id = ev.post_id
+            WHERE p.source_id = $1 ORDER BY ev.captured_at DESC
+            """,
+            source_id,
+        )
+        return {
+            "source": dict(source),
+            "stats": dict(stats),
+            "posts": [dict(x) for x in posts],
+            "entities": [dict(x) for x in entities],
+            "evidence": [dict(x) for x in evidence],
+        }
+
+@app.get("/wallet/{address}")
+async def wallet_dossier(address: str, request: Request, reveal: bool = False) -> dict:
+    if reveal:
+        require_ingest_token(request.headers.get("X-Ingest-Token"))
+    normalized = normalize_entity_value("WALLET", address)
+    assert pool is not None
+    async with pool.acquire() as conn:
+        entity_id = await conn.fetchval(
+            "SELECT id FROM entities WHERE entity_type = 'WALLET' AND value_hash = $1",
+            hash_value(normalized),
+        )
+        if not entity_id:
+            raise HTTPException(404, "Кошелёк не найден")
+        return await fetch_entity_dossier(conn, entity_id, reveal)
+
+@app.get("/graph")
+async def graph(min_risk: float = Query(0.0, ge=0, le=1), limit: int = Query(2000, ge=1, le=10000)) -> dict:
+    assert pool is not None
+    async with pool.acquire() as conn:
+        edges = await conn.fetch(
+            """
+            SELECT r.id, r.source_entity_id AS source, r.target_entity_id AS target,
+                   r.relation_type AS label, r.confidence, r.risk_score, r.description, r.evidence_post_id
+            FROM relations r WHERE r.risk_score >= $1
+            ORDER BY r.risk_score DESC, r.last_seen DESC LIMIT $2
+            """,
+            min_risk, limit,
+        )
+        node_ids = {row["source"] for row in edges} | {row["target"] for row in edges}
+        nodes = []
+        if node_ids:
+            node_rows = await conn.fetch(
+                """
+                SELECT id, entity_type AS type, display_value AS label, risk_score, category, city, metadata
+                FROM entities WHERE id = ANY($1::bigint[])
+                """,
+                list(node_ids),
+            )
+            nodes = [dict(x) for x in node_rows]
+        return {"nodes": nodes, "edges": [dict(x) for x in edges]}
+
+@app.get("/stats")
+async def stats() -> dict:
+    assert pool is not None
+    async with pool.acquire() as conn:
+        totals = await conn.fetchrow(
+            """
+            SELECT
+              (SELECT COUNT(*) FROM projects WHERE status = 'ACTIVE') AS projects,
+              (SELECT COUNT(*) FROM sources) AS sources,
+              (SELECT COUNT(*) FROM posts) AS posts,
+              (SELECT COUNT(*) FROM posts WHERE category <> 'CLEAN' AND risk_score >= 0.5) AS suspicious_posts,
+              (SELECT COUNT(*) FROM entities) AS entities,
+              (SELECT COUNT(*) FROM entities WHERE entity_type = 'WALLET') AS wallets,
+              (SELECT COUNT(*) FROM entities WHERE entity_type IN ('BANK_CARD','IBAN')) AS payment_details,
+              (SELECT COUNT(*) FROM evidence) AS evidence,
+              (SELECT COUNT(*) FROM alerts WHERE is_read = false) AS unread_alerts
+            """
+        )
+        by_category = await conn.fetch(
+            "SELECT category, COUNT(*) AS count, AVG(risk_score) AS avg_risk FROM posts GROUP BY category ORDER BY count DESC"
+        )
+        by_source = await conn.fetch(
+            """
+            SELECT s.source_type, COUNT(DISTINCT s.id) AS sources, COUNT(p.id) AS posts,
+                   COUNT(p.id) FILTER(WHERE p.category <> 'CLEAN' AND p.risk_score >= 0.5) AS suspicious
+            FROM sources s LEFT JOIN posts p ON p.source_id = s.id
+            GROUP BY s.source_type ORDER BY suspicious DESC
+            """
+        )
+        by_city = await conn.fetch(
+            """
+            SELECT COALESCE(s.city, 'Unknown') AS city, COUNT(DISTINCT s.id) AS sources,
+                   COUNT(p.id) FILTER(WHERE p.category <> 'CLEAN' AND p.risk_score >= 0.5) AS suspicious,
+                   AVG(p.risk_score) AS avg_risk
+            FROM sources s LEFT JOIN posts p ON p.source_id = s.id
+            GROUP BY COALESCE(s.city, 'Unknown') ORDER BY suspicious DESC
+            """
+        )
+        return {
+            "totals": dict(totals),
+            "by_category": [dict(x) for x in by_category],
+            "by_source": [dict(x) for x in by_source],
+            "by_city": [dict(x) for x in by_city],
+        }
+
+@app.get("/map")
+async def map_data() -> list[dict]:
+    assert pool is not None
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT s.city, COUNT(DISTINCT s.id) AS sources, COUNT(DISTINCT p.id) AS posts,
+                   COUNT(DISTINCT p.id) FILTER(WHERE p.category <> 'CLEAN' AND p.risk_score >= 0.5) AS suspicious,
+                   COALESCE(AVG(p.risk_score), 0) AS avg_risk, COALESCE(MAX(p.risk_score), 0) AS max_risk
+            FROM sources s LEFT JOIN posts p ON p.source_id = s.id
+            WHERE s.city IS NOT NULL GROUP BY s.city ORDER BY suspicious DESC
+            """
+        )
+        return [dict(x) for x in rows]
+
+@app.get("/alerts")
+async def alerts(unread_only: bool = True, limit: int = Query(100, ge=1, le=1000)) -> list[dict]:
+    assert pool is not None
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT a.*, s.name AS source_name, p.url AS post_url, e.display_value AS entity
+            FROM alerts a
+            LEFT JOIN sources s ON s.id = a.source_id
+            LEFT JOIN posts p ON p.id = a.post_id
+            LEFT JOIN entities e ON e.id = a.entity_id
+            WHERE ($1::boolean = false OR a.is_read = false)
+            ORDER BY a.created_at DESC LIMIT $2
+            """,
+            unread_only, limit,
+        )
+        return [dict(r) for r in rows]
+
+@app.patch("/alerts/{alert_id}/read")
+async def mark_alert_read(alert_id: int, request: Request) -> dict:
     require_ingest_token(request.headers.get("X-Ingest-Token"))
     assert pool is not None
     async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO tags(name, label_ru, label_kk, label_en, color)
-            VALUES($1,$2,$3,$4,$5)
-            ON CONFLICT(name) DO NOTHING
-            """,
-            tag.name, tag.label_ru, tag.label_kk, tag.label_en, tag.color,
-        )
-    return {"status": "created", "name": tag.name}
+        updated = await conn.fetchval("UPDATE alerts SET is_read = true WHERE id = $1 RETURNING id", alert_id)
+        if not updated:
+            raise HTTPException(404, "Алерт не найден")
+        return {"status": "success", "alert_id": updated}
 
-# ---------- ОСТАЛЬНЫЕ ЭНДПОИНТЫ (статистика, досье и т.д.) ----------
-# (код полностью сохранён из предыдущей версии, но без статей)
-# Ниже приведены только самые важные для краткости; в финальном коде они все есть.
-
-# /wallets, /sources/stats, /trend, /channels, /suspicious, /entity/dossier, /channel/dossier, /wallet, /graph, /stats, /map, /alerts, /alerts/read, /, /docs
-
-# Для экономии места я пропущу повторение уже знакомых эндпоинтов, но в полной версии они присутствуют.
-# В ответе я приложу полный ZIP-архив со всеми файлами.
-
-# ---------- ЗАПУСК ----------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
