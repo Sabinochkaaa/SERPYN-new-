@@ -1,4 +1,3 @@
-мой старый рабочий сервер
 import hashlib
 import json
 import logging
