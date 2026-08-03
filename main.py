@@ -514,12 +514,18 @@ async def send_telegram_alert(
     cat_info = CATEGORY_CACHE.get(category, {})
     cat_label = cat_info.get("name_ru") or category
 
+    # Экранируем поля, которые попадают в текст
+    source_name_esc = escape_markdown(source_name)
+    cat_label_esc = escape_markdown(cat_label)
+    title_esc = escape_markdown((title or '')[:200])
+    source_type_esc = escape_markdown(source_type or '—')
+
     message = (
         f"🚨 *Новое обнаружение — SERPYN*\n"
-        f"📌 *Источник:* {source_name} ({source_type or '—'})\n"
-        f"📂 *Категория:* `{category}` — {cat_label}\n"
+        f"📌 *Источник:* {source_name_esc} ({source_type_esc})\n"
+        f"📂 *Категория:* `{category}` — {cat_label_esc}\n"
         f"📊 *Риск:* {risk_score:.2f} ({severity_for(risk_score)})\n"
-        f"📝 *Тема:* {(title or '')[:200]}\n"
+        f"📝 *Тема:* {title_esc}\n"
     )
     if post_url:
         message += f"\n🔗 [Открыть пост]({post_url})"
@@ -530,44 +536,25 @@ async def send_telegram_alert(
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
-            # Если есть скриншоты — отправляем ПЕРВОЕ фото с полным текстом в caption
+            payload = {
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+                "parse_mode": "Markdown",
+                "disable_web_page_preview": True,
+            }
+            if reply_markup:
+                payload["reply_markup"] = reply_markup
+            await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json=payload)
             if evidence_urls:
-                first_url = evidence_urls[0]
-                await client.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-                    json={
-                        "chat_id": TELEGRAM_CHAT_ID,
-                        "photo": first_url,
-                        "caption": message,
-                        "parse_mode": "Markdown",
-                        "reply_markup": reply_markup,
-                    },
-                )
-                # Остальные фото (если есть) отправляем без подписи или с краткой
-                for url in evidence_urls[1:10]:
+                for url in evidence_urls[:10]:
                     await client.post(
                         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-                        json={
-                            "chat_id": TELEGRAM_CHAT_ID,
-                            "photo": url,
-                            "caption": "📸 Дополнительный скриншот",
-                        },
+                        json={"chat_id": TELEGRAM_CHAT_ID, "photo": url, "caption": f"📸 {(title_esc)[:60]}"},
                     )
-            else:
-                # Если скриншотов нет — отправляем только текст
-                payload = {
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message,
-                    "parse_mode": "Markdown",
-                    "disable_web_page_preview": True,
-                }
-                if reply_markup:
-                    payload["reply_markup"] = reply_markup
-                await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json=payload)
-
             logger.info("Telegram-уведомление отправлено")
         except Exception:
             logger.exception("Ошибка отправки Telegram-уведомления")
+            
 
 # ============================================================
 # PYDANTIC МОДЕЛИ
