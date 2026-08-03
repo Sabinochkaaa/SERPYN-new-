@@ -514,7 +514,7 @@ async def send_telegram_alert(
     cat_info = CATEGORY_CACHE.get(category, {})
     cat_label = cat_info.get("name_ru") or category
 
-    # Экранируем поля, которые попадают в текст
+    # Экранируем все поля, которые попадают в текст
     source_name_esc = escape_markdown(source_name)
     cat_label_esc = escape_markdown(cat_label)
     title_esc = escape_markdown((title or '')[:200])
@@ -527,6 +527,7 @@ async def send_telegram_alert(
         f"📊 *Риск:* {risk_score:.2f} ({severity_for(risk_score)})\n"
         f"📝 *Тема:* {title_esc}\n"
     )
+
     if post_url:
         message += f"\n🔗 [Открыть пост]({post_url})"
 
@@ -545,16 +546,20 @@ async def send_telegram_alert(
             if reply_markup:
                 payload["reply_markup"] = reply_markup
             await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json=payload)
+
             if evidence_urls:
                 for url in evidence_urls[:10]:
                     await client.post(
                         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-                        json={"chat_id": TELEGRAM_CHAT_ID, "photo": url, "caption": f"📸 {(title_esc)[:60]}"},
+                        json={
+                            "chat_id": TELEGRAM_CHAT_ID,
+                            "photo": url,
+                            "caption": f"📸 {title_esc[:60]}",
+                        },
                     )
             logger.info("Telegram-уведомление отправлено")
         except Exception:
             logger.exception("Ошибка отправки Telegram-уведомления")
-            
 
 # ============================================================
 # PYDANTIC МОДЕЛИ
