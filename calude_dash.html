@@ -1,0 +1,1212 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>СЕРПІН — Pyramid Guard KZ</title>
+  
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+  <script src="https://unpkg.com/@supabase/supabase-js@2"></script>
+
+  <!-- d3 нужен для физики графа связей (force-directed layout) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
+  
+  <!-- Библиотеки для генерации PDF -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+  <style>
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    html,body,#root{min-height:100%}
+    body{font-family:'JetBrains Mono',monospace;-webkit-font-smoothing:antialiased}
+    ::-webkit-scrollbar{width:6px;height:6px}
+    ::-webkit-scrollbar-thumb{background:#ccc;border-radius:4px}
+    @keyframes pulseLive{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(1.3)}}
+    @keyframes slideIn{from{transform:translateY(-10px);opacity:0}to{transform:translateY(0);opacity:1}}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    button,a{cursor:pointer}
+
+    /* Стили для экспорта в PDF.
+       ВАЖНО: контейнер уводится за пределы экрана через left:-9999px,
+       но НЕ visibility:hidden и НЕ display:none — html2canvas не умеет
+       корректно отрисовывать скрытые (visibility/display) узлы и
+       возвращает пустой (белый) canvas. Оффскрин-позиционирования
+       достаточно, чтобы пользователь ничего не видел. */
+    .pdf-export-container {
+      position: fixed;
+      left: -10000px;
+      top: 0;
+      width: 780px;
+      padding: 20mm 15mm;
+      background: #f8fafc;
+      box-sizing: border-box;
+      z-index: 10000;
+      pointer-events: none;
+    }
+    .pdf-export-container .dossier-a4-layout {
+      border: none !important;
+      padding: 0 !important;
+      background: #fff;
+    }
+
+    .dossier-a4-layout {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      color: #1e293b;
+      font-size: 9.5pt;
+      line-height: 1.4;
+      background-color: #ffffff;
+      position: relative;
+      padding: 15px 15px 15px 15px;
+      border-radius: 8px;
+    }
+    .dossier-a4-layout img.watermark-logo {
+      position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+      width: 55%; max-width: 400px; z-index: 0; opacity: 0.04; pointer-events: none; image-rendering: auto;
+    }
+    .dossier-a4-layout .header-table { width: 100%; border-collapse: collapse; margin-bottom: 12px; border-bottom: 2px solid #cbd5e1; padding-bottom: 8px; position:relative; z-index:1; background:#fff; }
+    .dossier-a4-layout .logo-cell { width: 220px; vertical-align: middle; }
+    .dossier-a4-layout .logo-cell img { max-height: 45px; width: auto; display: block; }
+    .dossier-a4-layout .title-cell { vertical-align: middle; text-align: right; }
+    .dossier-a4-layout .doc-title { font-size: 14pt; font-weight: 800; color: #0f172a; text-transform: uppercase; letter-spacing: 0.5px; margin: 0; }
+    .dossier-a4-layout .doc-subtitle { font-size: 8.5pt; color: #64748b; margin-top: 2px; }
+    .dossier-a4-layout .status-table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #e2e8f0; border-radius: 6px; margin-bottom: 12px; position:relative; z-index:1; }
+    .dossier-a4-layout .status-cell { padding: 8px 12px; font-size: 8.5pt; border-right: 1px solid #f1f5f9; }
+    .dossier-a4-layout .status-cell:last-child { border-right: none; }
+    .dossier-a4-layout .badge-danger { display: inline-block; background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; padding: 2px 6px; border-radius: 4px; font-weight: 700; }
+    .dossier-a4-layout .badge-active { display: inline-block; background: #f0fdf4; color: #166534; border: 1px solid #bbf7d0; padding: 2px 6px; border-radius: 4px; font-weight: 600; }
+    .dossier-a4-layout h2 { font-size: 10.5pt; font-weight: 700; color: #0f172a; text-transform: uppercase; margin: 10px 0 6px 0; padding-left: 8px; border-left: 3.5px solid #2563eb; letter-spacing: 0.3px; position:relative; z-index:1; background:#fff; }
+    .dossier-a4-layout .info-table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #e2e8f0; border-radius: 6px; margin-bottom: 10px; position:relative; z-index:1; }
+    .dossier-a4-layout .info-table td, .dossier-a4-layout .info-table th { padding: 6px 8px; border-bottom: 1px solid #f1f5f9; vertical-align: top; }
+    .dossier-a4-layout .info-table tr:last-child td { border-bottom: none; }
+    .dossier-a4-layout .label-col { width: 28%; color: #475569; font-weight: 600; background: #f8fafc; }
+    .dossier-a4-layout .value-col { width: 72%; color: #0f172a; }
+    .dossier-a4-layout .highlight-box { background: #fff1f2; border: 1px solid #ffe4e6; border-left: 3.5px solid #e11d48; padding: 8px 10px; border-radius: 4px; margin-bottom: 10px; font-size: 9pt; position:relative; z-index:1; }
+    .dossier-a4-layout .highlight-title { font-weight: 700; color: #9f1239; margin-bottom: 4px; }
+    .dossier-a4-layout .tag { display: inline-block; background: #eff6ff; color: #1e40af; border: 1px solid #bfdbfe; padding: 1px 5px; border-radius: 3px; font-size: 8pt; margin-right: 3px; margin-bottom: 2px; font-family: monospace; }
+    .dossier-a4-layout .red-flag-list { margin: 0; padding-left: 16px; color: #991b1b; }
+    .dossier-a4-layout .red-flag-list li { margin-bottom: 3px; }
+    .dossier-a4-layout .footer { margin-top: 15px; padding-top: 8px; border-top: 1px solid #cbd5e1; font-size: 7.5pt; color: #94a3b8; text-align: justify; position:relative; z-index:1; background:#fff; }
+    .dossier-a4-layout .code-text { font-family: ui-monospace, monospace; font-size: 8.5pt; background: #f1f5f9; padding: 1px 4px; border-radius: 3px; color: #0f172a; }
+    @media print { .action-sidebar { display: none !important; } }
+
+    /* Граф связей */
+    .graph-canvas-wrap{position:relative;width:100%;height:100%;overflow:hidden;touch-action:none}
+    .graph-node text{pointer-events:none;user-select:none}
+    .graph-legend-chip{display:inline-flex;align-items:center;gap:6px;font-size:10px;padding:3px 8px;border-radius:20px;cursor:pointer;user-select:none;transition:opacity .15s}
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useMemo, useCallback } = React;
+
+const API = 'https://serpyn-new-serpyn.up.railway.app';
+const SERVER_BASE = API;
+const INGEST_TOKEN = 'SABINATOKENotakuSerpyn2026!';
+const GROQ_KEY = 'serpin_groq_key';
+const REPORTS_KEY = 'serpin_reports';
+const SUPABASE_URL = "https://jxfuzvrfmirnxvxsniuq.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imp4ZnV6dnJmbWlybnh2eHNuaXVxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU2NzA0ODMsImV4cCI6MjEwMTI0NjQ4M30.BA-Dm6rm4I71gnmAmbcZQmRpkxs6GpZMZQG9VJNTrZE";
+const SCREENSHOT_BUCKET = 'screenshots';
+const supabaseClient = (typeof supabase !== 'undefined' && SUPABASE_ANON_KEY && SUPABASE_ANON_KEY.startsWith('eyJ')) ? supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
+
+function extractHandle(raw){
+  if(!raw || typeof raw !== 'string') return null;
+  const s = String(raw).trim();
+  if(!s) return null;
+  let m = s.match(/t\.me\/(?:\+)?([A-Za-z0-9_]+)/i);
+  if(m) return m[1];
+  m = s.match(/t\.me\/joinchat\/([A-Za-z0-9_\-]+)/i);
+  if(m) return m[1];
+  if(s.startsWith('@') && s.length<64 && !s.includes(' ')) return s.replace('@','').split('?')[0].split('/')[0];
+  if(s.length<40 && !s.includes('http') && !s.includes('?') && !s.includes('/')) return s.replace('@','');
+  return null;
+}
+function cleanUsername(raw){
+  if(!raw) return '—';
+  const s = String(raw);
+  const h = extractHandle(s);
+  if(h) return h;
+  if(s.startsWith('http')){
+    try{ const u = new URL(s); const path = u.pathname.replace(/^\/+/, ''); if(path) return path.split('/')[0].slice(0,32); return u.host; }catch(e){ return s.slice(0,24)+'…'; }
+  }
+  return s.length>28? s.slice(0,28)+'…' : s;
+}
+function cleanUrlForDisplay(raw){
+  if(!raw) return '';
+  const s = String(raw);
+  if(s.length>48) return s.slice(0,48)+'…';
+  return s;
+}
+function toPublicUrl(raw, bucket){
+  if(!raw) return null;
+  if(typeof raw !== 'string') return null;
+  let s = raw.trim();
+  if(!s) return null;
+  if(s.endsWith('?')) s = s.slice(0,-1);
+  s = s.replace(/\?+\s*$/, (m)=> m.includes('=')?m:'' );
+  if(s.endsWith('?')) s=s.slice(0,-1);
+  if(s.startsWith('http://')||s.startsWith('https://')) return s;
+  let path = s.replace(/^\/+/, '').trim();
+  const b = bucket || SCREENSHOT_BUCKET;
+  if(path.startsWith(b+'/')) return `${SUPABASE_URL}/storage/v1/object/public/${path}`;
+  return `${SUPABASE_URL}/storage/v1/object/public/${b}/${path}`;
+}
+async function uploadViaServer(fileOrB64, fileName){
+  try{
+    let b64 = "";
+    if(typeof fileOrB64 === 'string' && fileOrB64.startsWith('data:')) b64 = fileOrB64;
+    else if(fileOrB64 instanceof File) b64 = await new Promise((res, rej)=>{ const r=new FileReader(); r.onload=e=>res(e.target.result); r.onerror=rej; r.readAsDataURL(fileOrB64); });
+    else if(fileOrB64 && fileOrB64.b64) b64 = fileOrB64.b64;
+    if(!b64) return "";
+    const cleanB64 = b64.includes(',') ? b64.split(',')[1] : b64;
+    const fname = fileName || `screenshot_${Date.now()}.png`;
+    const endpoints = [`${SERVER_BASE}/upload_screenshot`, `${SERVER_BASE}/upload`, `${SERVER_BASE}/api/upload_screenshot`];
+    for(const ep of endpoints){
+      try{
+        const resp = await fetch(ep, { method: 'POST', headers: {'Content-Type':'application/json','X-Ingest-Token':INGEST_TOKEN}, body: JSON.stringify({file_name:fname, file_data:cleanB64, folder:'screenshots'}) });
+        const data = await resp.json().catch(()=>({}));
+        const url = data.url||data.publicUrl||data.public_url||data.storage_url||data.file_url||data.link||"";
+        if(url && url.startsWith('http')) return url;
+      }catch(e){ console.warn('upload fail', ep, e); }
+    }
+    return "";
+  }catch(e){ console.error('uploadViaServer', e); return ""; }
+}
+async function fetchStorageScreenshots(idOrUsername){
+  if(!supabaseClient || !idOrUsername) return [];
+  const idStr = String(idOrUsername);
+  let keys = [];
+  if(/^\d+$/.test(idStr)) keys.push(idStr);
+  const handle = extractHandle(idStr);
+  if(handle && handle.length<50) keys.push(handle);
+  if(idStr.length<40 && !idStr.includes('http') && !idStr.includes('?')) keys.push(idStr.replace('@',''));
+  keys = [...new Set(keys)].slice(0,3);
+  let all = [];
+  for(const key of keys){
+    try{
+      const { data, error } = await supabaseClient.storage.from(SCREENSHOT_BUCKET).list(key, { limit: 20, sortBy:{column:'created_at',order:'desc'} });
+      if(error || !data) continue;
+      const urls = data.filter(f=>f.name && !f.name.endsWith('/')).map(f=>{ const { data: pub } = supabaseClient.storage.from(SCREENSHOT_BUCKET).getPublicUrl(`${key}/${f.name}`); return pub?.publicUrl; }).filter(Boolean);
+      all.push(...urls);
+    }catch(e){ console.warn('fetchStorage', e); }
+  }
+  return [...new Set(all)];
+}
+function extractHttpLinks(text){
+  if(!text) return [];
+  const re = /(https?:\/\/[^\s\)\]"'<>]+)/gi;
+  const matches = text.match(re) || [];
+  const cleaned = matches.map(s => s.replace(/[.,;!)]+$/, ''));
+  return [...new Set(cleaned)];
+}
+function normalizeLinks(src){
+  const pm = src.platform_meta || src.meta || {};
+  const l = pm.links || src.links || {};
+  const usernames = [...(pm.linked_channels||[]), ...(pm.linked_usernames||[]), ...(l.usernames||[]), ...(src.linked_channels||[]), ...(l.channels||[])];
+  const invites = [...(pm.invite_links||[]), ...(pm.invites||[]), ...(l.invites||[]), ...(src.invite_links||[])];
+  const http = [...(pm.http_links||[]), ...(pm.external_links||[]), ...(pm.urls||[]), ...(l.http||[]), ...(l.external||[]), ...(src.urls||[]), ...(src.http_links||[])];
+  const fromDesc = extractHttpLinks(pm.description||src.description||'');
+  return { usernames: [...new Set(usernames.map(s=>String(s).replace('@','').trim()).filter(Boolean))], invites: [...new Set([...invites, ...fromDesc.filter(u=>u.includes('t.me/'))].filter(Boolean))], http: [...new Set([...http, ...fromDesc].filter(Boolean))] };
+}
+function cleanStorageUrl(raw){
+  if(!raw || typeof raw!=='string') return null;
+  let s = raw.trim(); if(!s) return null;
+  s = s.replace(/\?+\s*$/, (m)=> m.includes('=')?m:'' );
+  if(s.endsWith('?')) s = s.slice(0,-1);
+  return toPublicUrl(s);
+}
+function getScreenshotsFromDetail(detail){
+  if(!detail) return [];
+  let out = [];
+  const push = (v)=>{ if(!v) return; if(typeof v==='string'){ const u=cleanStorageUrl(v); if(u) out.push(u); } else if(typeof v==='object'){ const raw = v.storage_url||v.original_url||v.url||v.path||v.public_url||v.publicUrl||v.screenshot_url||v.screenshot_path||v.image_url||v.photo_url||v.media_url||v.file_url||v.storage_path||null; if(raw){ const u=cleanStorageUrl(typeof raw==='string'?raw:String(raw)); if(u) out.push(u); } } };
+  const directFields = ['screenshots','screenshot_urls','screenshots_urls','images','media','photos','files','screenshot','image','photo'];
+  directFields.forEach(k=>{ const val = detail[k]; if(Array.isArray(val)) val.forEach(push); else if(val) push(val); });
+  ['evidence','evidences','proofs','screenshots_evidence'].forEach(k=>{ const arr = detail[k]; if(Array.isArray(arr)) arr.forEach(item=>{ if(!item) return; push(item.storage_url); push(item.original_url); push(item.screenshot_url); push(item.screenshot_path); push(item.screenshot); push(item.image_url); push(item.image_path); push(item.photo_url); push(item.media_url); push(item.file_url); push(item.path); push(item.storage_path); if(item.screenshots) (Array.isArray(item.screenshots)?item.screenshots:[item.screenshots]).forEach(push); }); });
+  if(detail.source){ const ch = detail.source; ['screenshot_url','image_url','photo_url','storage_url',...directFields].forEach(k=>{ const val = ch[k]; if(Array.isArray(val)) val.forEach(push); else if(val) push(val); }); }
+  if(detail.channel){ const ch = detail.channel; ['screenshot_url','image_url','photo_url','storage_url',...directFields].forEach(k=>{ const val = ch[k]; if(Array.isArray(val)) val.forEach(push); else if(val) push(val); }); }
+  if(Array.isArray(detail.posts)) detail.posts.forEach(p=>{ push(p.screenshot_url); push(p.screenshot_path); push(p.screenshot); push(p.image_url); push(p.photo_url); push(p.media_url); push(p.storage_url); });
+  return [...new Set(out.filter(Boolean))];
+}
+function getLinksFromDetail(detail){
+  if(!detail) return {usernames:[], invites:[], http:[], forwards:[], primary:null};
+  let usernames=[], invites=[], http=[], forwards=[]; let primary=null;
+  const addHttp = (v)=>{ if(!v||typeof v!=='string') return; const s=v.trim(); if(!s) return; http.push(s); if(!primary && (s.includes('t.me/')||s.includes('http'))) primary=s; };
+  if(detail.source){ const src = detail.source; if(src.url) addHttp(src.url); if(src.external_id && String(src.external_id).startsWith('http')) addHttp(src.external_id); if(src.link) addHttp(src.link); if(src.username && String(src.username).startsWith('http')) addHttp(src.username); }
+  if(Array.isArray(detail.posts)) detail.posts.forEach(p=>{ if(p.url) addHttp(p.url); if(p.external_id && String(p.external_id).startsWith('http')) addHttp(p.external_id); if(p.link) addHttp(p.link); });
+  ['evidence','evidences','proofs'].forEach(k=>{ const arr = detail[k]; if(Array.isArray(arr)) arr.forEach(ev=>{ if(ev?.url) addHttp(ev.url); if(ev?.original_url) addHttp(ev.original_url); if(ev?.link) addHttp(ev.link); }); });
+  const l = detail.links||detail.platform_meta?.links||detail.channel?.platform_meta?.links||{};
+  if(l.usernames) usernames.push(...l.usernames); if(l.channels) usernames.push(...l.channels); if(l.invites) invites.push(...l.invites); if(l.http) l.http.forEach(addHttp); if(l.external) l.external.forEach(addHttp);
+  if(Array.isArray(detail.linked_channels)) usernames.push(...detail.linked_channels);
+  if(Array.isArray(detail.urls)) detail.urls.forEach(addHttp);
+  if(detail.channel?.url) addHttp(detail.channel.url);
+  if(detail.url) addHttp(detail.url);
+  const uniq = (arr)=>[...new Set(arr.map(v=> String(v).trim()).filter(Boolean))];
+  const uniqHttp = uniq(http);
+  if(!primary) primary = uniqHttp.find(u=>u.includes('t.me/')) || uniqHttp[0] || null;
+  return {usernames:uniq(usernames), invites:uniq(invites), http:uniqHttp, forwards:uniq(forwards), primary};
+}
+// ── Построение "предполагаемой" ссылки, если backend её не прислал ──────────
+// Раньше ссылка терялась, если API не вернул явное поле url/link (часто бывает,
+// если парсер прислал только username, а не готовый url). Теперь пробуем
+// собрать ссылку по source_type + username/external_id для всех платформ.
+function buildFallbackLink(sourceType, rawUsername, externalId){
+  const handle = extractHandle(rawUsername) || extractHandle(externalId);
+  const type = String(sourceType||'').toUpperCase();
+  if(!handle) {
+    if(externalId && String(externalId).startsWith('http')) return String(externalId);
+    if(rawUsername && String(rawUsername).startsWith('http')) return String(rawUsername);
+    return null;
+  }
+  switch(type){
+    case 'TELEGRAM': return `https://t.me/${handle}`;
+    case 'YOUTUBE': return `https://www.youtube.com/@${handle}`;
+    case 'TIKTOK': return `https://www.tiktok.com/@${handle}`;
+    case 'INSTAGRAM': return `https://www.instagram.com/${handle}`;
+    case 'THREADS': return `https://www.threads.net/@${handle}`;
+    case 'TWITTER': case 'X': return `https://x.com/${handle}`;
+    case 'FACEBOOK': return `https://www.facebook.com/${handle}`;
+    case 'VK': return `https://vk.com/${handle}`;
+    case 'DISCORD': return `https://discord.gg/${handle}`;
+    case 'WHATSAPP': return `https://wa.me/${handle}`;
+    case 'LINKEDIN': return `https://www.linkedin.com/in/${handle}`;
+    default: return null;
+  }
+}
+function getPrimaryLink(d, detail){
+  if(detail){ const ld = getLinksFromDetail(detail); if(ld.primary) return ld.primary; if(ld.http.length>0) return ld.http[0]; }
+  if(d.url && d.url.startsWith('http')) return d.url;
+  if(d.rawUsername && String(d.rawUsername).startsWith('http')) return d.rawUsername;
+  if(d.username && String(d.username).startsWith('http')) return d.username;
+  // Фолбэк: собираем ссылку сами из типа источника + username/external_id
+  const fallback = buildFallbackLink(d.source_type, d.rawUsername||d.username, d.external_id||d.id);
+  if(fallback) return fallback;
+  return null;
+}
+const vc = v => v==='dangerous'?'#FF2D2D':v==='suspicious'?'#FFB800':'#00C950';
+const sc = s => s>70?{background:'#FF2D2D',color:'#fff'}:s>40?{background:'#FFB800',color:'#000'}:{background:'#00C950',color:'#000'};
+async function apiFetch(path, opts){
+  const r = await fetch(API+path, opts);
+  if(!r.ok) throw new Error(`HTTP ${r.status} ${path}`);
+  return r.json();
+}
+async function loadAll(){
+  const [channels, suspicious] = await Promise.all([ apiFetch('/channels?limit=200'), apiFetch('/suspicious?min_risk=0&limit=500'), ]);
+  const bySource={};
+  suspicious.forEach(p=>{ const sid=String(p.source_id); (bySource[sid]||(bySource[sid]=[])).push(p); });
+  return channels.map(src=>{
+    const posts=bySource[String(src.id)]||[];
+    const risk=src.risk_score||0;
+    const rPct=Math.round(risk*100);
+    const verdict=risk>=0.75?'dangerous':risk>=0.4?'suspicious':'safe';
+    const cats=[...new Set(posts.map(p=>p.category).filter(Boolean))];
+    const kws=[...new Set(posts.flatMap(p=>p.red_flags||[]))];
+    const pm = src.platform_meta||{};
+    const linkObj = normalizeLinks(src);
+    const forwards = pm.forwards_from || pm.forwarded_from || src.forwards_from || pm.forward_sources || [];
+    const rawShots = [ src.screenshot_url, src.screenshot_path, src.image_url, src.photo_url, pm.screenshot_url, pm.screenshot, pm.image_url, ...(Array.isArray(pm.screenshots)?pm.screenshots:[]), ...(Array.isArray(pm.screenshot_urls)?pm.screenshot_urls:[]), ...(Array.isArray(pm.images)?pm.images:[]), ...(Array.isArray(src.screenshots)?src.screenshots:[]), ];
+    const screenshots = [...new Set(rawShots.map(x=>{ if(!x) return null; if(typeof x==='string') return toPublicUrl(x); return toPublicUrl(x?.url||x?.path||x?.screenshot_url||x?.publicUrl||null); }).filter(Boolean))];
+    const rawUsername = src.username||src.external_id||src.name||'—';
+    return{
+      id:String(src.id),
+      external_id: src.external_id||null,
+      username:rawUsername,
+      displayUsername: cleanUsername(rawUsername),
+      rawUsername: rawUsername,
+      title:src.name||cleanUsername(rawUsername)||'Без названия',
+      description:pm.description||src.description||'',
+      source_type:src.source_type||'OTHER',
+      participants:pm.subscribers||pm.members||src.participants||0,
+      url:src.url||src.link||src.source_url||src.channel_url||pm.url||pm.link||buildFallbackLink(src.source_type, rawUsername, src.external_id),
+      verdict,riskPct:rPct,cats,kws,
+      reason:posts[0]?.explanation||src.category||pm.risk_reason||'—',
+      messages:posts.slice(0,50).map(p=>{ const pm2 = p.platform_meta||p.meta||{}; const shotRaw = p.screenshot_url||p.screenshot_path||p.screenshot||p.image_url||p.image_path||p.image||p.media_url||p.media_path||p.photo_url||p.photo||p.file_url||p.path||p.storage_path||pm2.screenshot_url||pm2.image_url||null; const postLinks = [...extractHttpLinks(p.raw_text||p.text||''), ...(p.urls||[]), ...(p.links||[]), ...(pm2.urls||[])]; return{ id:String(p.id), text:p.raw_text||p.text||'', date:p.published_at||p.created_at||'', views:p.views||0,forwards:p.forwards||0, screenshot:toPublicUrl(typeof shotRaw==='string'?shotRaw:(shotRaw?.url||shotRaw?.path||null)), http_links: [...new Set(postLinks.filter(Boolean))], url: p.url||p.link||p.source_url||null, }; }),
+      screenshots,
+      posts_count:posts.length,
+      links: linkObj,
+      forwards_from: [...new Set(forwards.map(x=> typeof x==='string'?x:(x?.username||x?.name||x?.title||'')).filter(Boolean))],
+    };
+  });
+}
+
+function Spinner(){
+  return <div style={{display:'flex',justifyContent:'center',alignItems:'center',padding:40}}>
+    <div style={{width:28,height:28,border:'3px solid #e5e7eb',borderTopColor:'#333',borderRadius:'50%',animation:'spin .7s linear infinite'}}/>
+  </div>;
+}
+function RiskBadge({score}){
+  return <span style={{...sc(score),fontSize:10,fontWeight:700,padding:'2px 7px',borderRadius:6,fontFamily:'inherit'}}>{score}</span>;
+}
+function Dot({verdict}){
+  return <span style={{width:8,height:8,borderRadius:'50%',background:vc(verdict),display:'inline-block',flexShrink:0}}/>;
+}
+
+// ── Карточка досье в списке ──────────────────────────────────────────────────
+function DCard({d,dark,border,onOpen}){
+  const [hover,setHover]=useState(false);
+  return(
+    <button
+      onClick={()=>onOpen(d)}
+      onMouseEnter={()=>setHover(true)}
+      onMouseLeave={()=>setHover(false)}
+      style={{
+        textAlign:'left',background:dark?'#121212':'#fff',
+        border:`1px solid ${hover?(dark?'#fff':'#000'):border}`,
+        borderRadius:12,padding:16,cursor:'pointer',fontFamily:'inherit',
+        color:dark?'#fff':'#000',animation:'slideIn .3s both',
+        position:'relative',overflow:'hidden',transition:'border-color .15s',width:'100%',
+      }}>
+      <div style={{position:'absolute',left:0,top:0,bottom:0,width:3,background:vc(d.verdict)}}/>
+      <div style={{paddingLeft:10}}>
+        <div style={{display:'flex',alignItems:'flex-start',gap:10,justifyContent:'space-between'}}>
+          <div style={{display:'flex',alignItems:'center',gap:10,minWidth:0,flex:1}}>
+            <div style={{width:34,height:34,borderRadius:8,background:vc(d.verdict),display:'flex',alignItems:'center',justifyContent:'center',
+              color:d.verdict==='suspicious'?'#000':'#fff',fontWeight:700,fontSize:13,flexShrink:0}}>
+              {(d.title[0]||'?').toUpperCase()}
+            </div>
+            <div style={{minWidth:0}}>
+              <div style={{fontSize:13,fontWeight:700,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{d.title}</div>
+              <div title={d.rawUsername||d.username} style={{fontSize:11,color:dark?'#888':'#666',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',maxWidth:140}}>@{d.displayUsername||cleanUsername(d.username)} · {d.source_type}</div>
+            </div>
+          </div>
+          <div style={{flexShrink:0}}><RiskBadge score={d.riskPct}/></div>
+        </div>
+        {d.cats.length>0&&<div style={{display:'flex',flexWrap:'wrap',gap:4,marginTop:8}}>
+          {d.cats.slice(0,4).map(c=><span key={c} style={{fontSize:9,padding:'2px 6px',border:`1px solid ${border}`,borderRadius:6,textTransform:'uppercase'}}>{c}</span>)}
+        </div>}
+        {d.kws.length>0&&<div style={{display:'flex',flexWrap:'wrap',gap:4,marginTop:6}}>
+          {d.kws.slice(0,3).map(k=><span key={k} style={{fontSize:9,padding:'2px 6px',borderRadius:6,background:'rgba(255,45,45,.1)',color:'#FF2D2D',border:'1px solid rgba(255,45,45,.2)'}}>{k}</span>)}
+        </div>}
+        <div style={{display:'flex',alignItems:'center',gap:8,marginTop:8,fontSize:10,color:dark?'#888':'#666'}}>
+          <Dot verdict={d.verdict}/><span style={{textTransform:'uppercase',letterSpacing:'0.05em'}}>{d.verdict}</span>
+          <span style={{marginLeft:'auto'}}>📄 {d.posts_count} постов</span>
+        </div>
+      </div>
+    </button>
+  );
+}
+
+// ── КОМПОНЕНТ ДЛЯ ОТОБРАЖЕНИЯ КРАСИВОГО ДОСЬЕ ────────────────────────────
+function DossierView({d, detail, screenshots, msgs, isEditMode}) {
+  if (!detail) return <div style={{padding:20, color:'#64748b'}}>Загрузка данных...</div>;
+  const primaryLink = getPrimaryLink(d, detail) || d.url || '';
+  const firstScreenshotUrl = screenshots.length > 0 ? screenshots[0] : '#';
+
+  return (
+    <div className="dossier-a4-layout" contentEditable={isEditMode}>
+      <img src="serpyn_logo.png" className="watermark-logo" alt="watermark" crossOrigin="anonymous"/>
+      
+      <table className="header-table">
+        <tr>
+          <td className="logo-cell"><img src="serpyn_logo.png" alt="SERPYN Logo" crossOrigin="anonymous" style={{maxHeight:'45px', width:'auto', display:'block'}}/><div style={{fontSize:'8pt', color:'#64748b', marginTop:'2px'}}>OSINT INTELLIGENCE PLATFORM</div></td>
+          <td className="title-cell"><div className="doc-title">Досье объекта мониторинга</div><div className="doc-subtitle">Автоматизированный отчет системы киберразведки и OSINT</div></td>
+        </tr>
+      </table>
+
+      <table className="status-table"><tr>
+        <td className="status-cell"><b>ID Источника:</b> <span className="code-text">{d.id}</span></td>
+        <td className="status-cell"><b>Статус:</b> <span className={d.verdict === 'dangerous' ? 'badge-danger' : 'badge-active'}>{d.verdict.toUpperCase()}</span></td>
+        <td className="status-cell"><b>Категория:</b> <span className="code-text">{d.cats.join(', ') || 'N/A'}</span></td>
+        <td className="status-cell"><b>Уровень риска:</b> <span className="badge-danger">{d.riskPct} / 100</span></td>
+      </tr></table>
+
+      <h2>1. Основные параметры источника (Source)</h2>
+      <table className="info-table">
+        <tr><td className="label-col">Платформа / Тип</td><td className="value-col"><b>{d.source_type}</b></td></tr>
+        <tr><td className="label-col">Целевой URL</td><td className="value-col"><a href={primaryLink} style={{color:'#2563eb', textDecoration:'none'}}>{cleanUrlForDisplay(primaryLink)}</a></td></tr>
+        <tr><td className="label-col">Автор / Канал</td><td className="value-col">{d.title}</td></tr>
+        <tr><td className="label-col">Региональная привязка</td><td className="value-col">Казахстан ({d.country || 'KZ'})</td></tr>
+      </table>
+
+      <h2>2. Детализация выявленного объявления (Posts)</h2>
+      <div className="highlight-box"><div className="highlight-title">Исходный текст рекламы (Raw Text):</div><i>{msgs[0]?.text || 'Текст поста не доступен в базе'}</i></div>
+      <table className="info-table">
+        <tr><td className="label-col">Индикаторы риска (Red Flags)</td><td className="value-col"><ul className="red-flag-list">{d.kws.slice(0,5).map((k, i) => <li key={i}>{k}</li>)}</ul></td></tr>
+        <tr><td className="label-col">Ключевые слова-триггеры</td><td className="value-col">{d.kws.slice(0,10).map((k, i) => <span key={i} className="tag">{k}</span>)}</td></tr>
+      </table>
+
+      <h2>3. Связанные сущности и показатели</h2>
+      <table className="info-table">
+        <tr><td className="label-col">Агрегированная статистика</td><td className="value-col">Всего публикаций: <b>{d.posts_count}</b> | Уровень риска: <b>{d.riskPct}</b></td></tr>
+      </table>
+
+      <h2>4. Доказательная база (Evidence)</h2>
+      <table className="info-table">
+        <tr><td className="label-col">Скриншот фиксации</td><td className="value-col"><a href={firstScreenshotUrl} style={{color:'#2563eb', textDecoration:'none'}}>Ссылка на Supabase Storage Object (Скриншот)</a><br/><i>Примечание по обработке: Применено размытие (blur) для безопасности.</i></td></tr>
+      </table>
+
+      <h2>5. Экспертное заключение</h2>
+      <div style={{background:'#fff', border:'1px solid #e2e8f0', padding:'8px 10px', borderRadius:'6px', color:'#1e293b'}}>
+        Данный объект идентифицирован как <b>высокорисковый элемент</b>. Рекомендуется внесение в черный список и направление уведомления в службу модерации.<br/>
+        <b>Основание:</b> {d.reason}
+      </div>
+      <div className="footer"><b>Конфиденциально</b> | Сгенерировано аналитической платформой SERPYN OSINT | Документ предназначен для внутреннего использования и передачи в правоохранительные органы.</div>
+    </div>
+  );
+}
+
+// ── Модальное окно досье ────────────────────────────────────────────────────
+function DossierModal({d,dark,border,onClose}){
+  const [page,setPage]=useState(0);
+  const [detail,setDetail]=useState(null);
+  const [dLoading,setDLoading]=useState(true);
+  const [storageShots,setStorageShots]=useState([]);
+  const [isGeneratingPDF, setIsGeneratingPDF] = useState(false);
+  const [isEditMode, setIsEditMode] = useState(false); // Режим редактирования
+  
+  const bg=dark?'#0a0a0a':'#f8f8f6';
+  const cardBg=dark?'#121212':'#fff';
+  const muted=dark?'#888':'#666';
+ 
+  useEffect(()=>{
+    setDLoading(true);
+    apiFetch(`/channel/${d.id}/dossier`).then(data=>{setDetail(data);setDLoading(false)}).catch(()=>setDLoading(false));
+  },[d.id]);
+ 
+  useEffect(()=>{
+    let cancelled=false;
+    setStorageShots([]);
+    (async()=>{
+      const byId=await fetchStorageScreenshots(d.id);
+      if(cancelled) return;
+      if(byId.length>0){ setStorageShots(byId); return; }
+      const h = extractHandle(d.username) || extractHandle(d.rawUsername);
+      if(h){
+        const byHandle=await fetchStorageScreenshots(h);
+        if(!cancelled && byHandle.length>0){ setStorageShots(byHandle); return; }
+      }
+    })();
+    return ()=>{cancelled=true;};
+  },[d.id,d.username]);
+
+  const msgs=d.messages;
+  const totalPages=Math.max(1,Math.ceil(msgs.length/5));
+  const [uploading,setUploading]=useState(false);
+  const screenshots=useMemo(()=>{
+    const fromMsgs=d.messages.map(m=>m.screenshot).filter(Boolean);
+    const fromChannel=d.screenshots||[];
+    const fromDetail = getScreenshotsFromDetail(detail);
+    const combined = [...new Set([...fromDetail,...fromChannel,...fromMsgs,...storageShots].filter(Boolean))];
+    return combined.slice(0,20);
+  },[d.messages,d.screenshots,detail,storageShots]);
+
+  // Ожидаем полной загрузки всех <img> внутри узла — иначе html2canvas
+  // может захватить кадр раньше, чем логотип/скриншоты прогрузились,
+  // и получить пустые/белые области.
+  const waitForImages = useCallback((node) => {
+    const imgs = Array.from(node.querySelectorAll('img'));
+    return Promise.all(imgs.map(img => {
+      if (img.complete) return Promise.resolve();
+      return new Promise(resolve => {
+        img.onload = () => resolve();
+        img.onerror = () => resolve();
+        setTimeout(resolve, 3000); // страховка, чтобы не зависнуть навсегда
+      });
+    }));
+  }, []);
+
+  // ── ФУНКЦИЯ ГЕНЕРАЦИИ PDF (Прямая отрисовка через html2canvas и jsPDF) ──
+  const handleDownloadPDF = useCallback(async () => {
+    if(isGeneratingPDF) return;
+    setIsGeneratingPDF(true);
+
+    // Формируем контент
+    const primaryLink = getPrimaryLink(d, detail) || d.url || '';
+    const firstScreenshotUrl = screenshots.length > 0 ? screenshots[0] : '#';
+    
+    const htmlContent = `
+      <div style="position:relative; padding: 20mm 15mm; background:#f8fafc; width:100%; font-family:-apple-system,sans-serif; color:#1e293b; font-size:9.5pt; line-height:1.4; box-sizing:border-box;">
+        <img src="serpyn_logo.png" crossorigin="anonymous" style="position:absolute; top:50%; left:50%; transform:translate(-50%, -50%); width:55%; max-width:400px; z-index:0; opacity:0.04; pointer-events:none;" alt="watermark" onerror="this.style.display='none'"/>
+        <table style="width:100%; border-collapse:collapse; margin-bottom:12px; border-bottom:2px solid #cbd5e1; padding-bottom:8px; position:relative; z-index:1;">
+          <tr><td style="width:220px; vertical-align:middle;"><img src="serpyn_logo.png" crossorigin="anonymous" style="max-height:45px; width:auto; display:block;" onerror="this.style.display='none'"><div style="font-size:8pt; color:#64748b; margin-top:2px;">OSINT INTELLIGENCE PLATFORM</div></td><td style="vertical-align:middle; text-align:right;"><div style="font-size:14pt; font-weight:800; color:#0f172a; text-transform:uppercase; letter-spacing:0.5px;">Досье объекта мониторинга</div><div style="font-size:8.5pt; color:#64748b; margin-top:2px;">Автоматизированный отчет системы киберразведки и OSINT</div></td></tr>
+        </table>
+        <table style="width:100%; border-collapse:collapse; background:#fff; border:1px solid #e2e8f0; border-radius:6px; margin-bottom:12px; position:relative; z-index:1;"><tr>
+          <td style="padding:8px 12px; font-size:8.5pt; border-right:1px solid #f1f5f9;"><b>ID Источника:</b> <span style="font-family:ui-monospace,monospace; font-size:8.5pt; background:#f1f5f9; padding:1px 4px; border-radius:3px; color:#0f172a;">${d.id}</span></td>
+          <td style="padding:8px 12px; font-size:8.5pt; border-right:1px solid #f1f5f9;"><b>Статус:</b> <span style="display:inline-block; ${d.verdict === 'dangerous' ? 'background:#fef2f2; color:#991b1b; border:1px solid #fecaca;' : 'background:#f0fdf4; color:#166534; border:1px solid #bbf7d0;'} padding:2px 6px; border-radius:4px; font-weight:700;">${d.verdict.toUpperCase()}</span></td>
+          <td style="padding:8px 12px; font-size:8.5pt; border-right:1px solid #f1f5f9;"><b>Категория:</b> <span style="font-family:ui-monospace,monospace; font-size:8.5pt; background:#f1f5f9; padding:1px 4px; border-radius:3px; color:#0f172a;">${d.cats.join(', ') || 'N/A'}</span></td>
+          <td style="padding:8px 12px; font-size:8.5pt;"><b>Уровень риска:</b> <span style="display:inline-block; background:#fef2f2; color:#991b1b; border:1px solid #fecaca; padding:2px 6px; border-radius:4px; font-weight:700;">${d.riskPct} / 100</span></td>
+        </tr></table>
+        <h2 style="font-size:10.5pt; font-weight:700; color:#0f172a; text-transform:uppercase; margin:10px 0 6px 0; padding-left:8px; border-left:3.5px solid #2563eb; letter-spacing:0.3px; position:relative; z-index:1;">1. Основные параметры источника (Source)</h2>
+        <table style="width:100%; border-collapse:collapse; background:#fff; border:1px solid #e2e8f0; border-radius:6px; margin-bottom:10px; position:relative; z-index:1;"><tr><td style="width:28%; padding:6px 8px; border-bottom:1px solid #f1f5f9; vertical-align:top; color:#475569; font-weight:600; background:#f8fafc;">Платформа / Тип</td><td style="width:72%; padding:6px 8px; border-bottom:1px solid #f1f5f9; vertical-align:top; color:#0f172a;"><b>${d.source_type}</b></td></tr><tr><td style="width:28%; padding:6px 8px; border-bottom:1px solid #f1f5f9; vertical-align:top; color:#475569; font-weight:600; background:#f8fafc;">Целевой URL</td><td style="width:72%; padding:6px 8px; border-bottom:1px solid #f1f5f9; vertical-align:top; color:#0f172a;"><a href="${primaryLink}" style="color:#2563eb; text-decoration:none;">${cleanUrlForDisplay(primaryLink)}</a></td></tr><tr><td style="width:28%; padding:6px 8px; border-bottom:1px solid #f1f5f9; vertical-align:top; color:#475569; font-weight:600; background:#f8fafc;">Автор / Канал</td><td style="width:72%; padding:6px 8px; border-bottom:1px solid #f1f5f9; vertical-align:top; color:#0f172a;">${d.title}</td></tr><tr><td style="width:28%; padding:6px 8px; border-bottom:1px solid #f1f5f9; vertical-align:top; color:#475569; font-weight:600; background:#f8fafc;">Региональная привязка</td><td style="width:72%; padding:6px 8px; border-bottom:1px solid #f1f5f9; vertical-align:top; color:#0f172a;">Казахстан</td></tr></table>
+        <h2 style="font-size:10.5pt; font-weight:700; color:#0f172a; text-transform:uppercase; margin:10px 0 6px 0; padding-left:8px; border-left:3.5px solid #2563eb; letter-spacing:0.3px; position:relative; z-index:1;">2. Детализация выявленного объявления (Posts)</h2>
+        <div style="background:#fff1f2; border:1px solid #ffe4e6; border-left:3.5px solid #e11d48; padding:8px 10px; border-radius:4px; margin-bottom:10px; font-size:9pt; position:relative; z-index:1;"><div style="font-weight:700; color:#9f1239; margin-bottom:4px;">Исходный текст рекламы (Raw Text):</div><i>${(msgs[0]?.text || 'Текст поста не доступен в базе').replace(/</g,'&lt;')}</i></div>
+        <table style="width:100%; border-collapse:collapse; background:#fff; border:1px solid #e2e8f0; border-radius:6px; margin-bottom:10px; position:relative; z-index:1;"><tr><td style="width:28%; padding:6px 8px; border-bottom:1px solid #f1f5f9; vertical-align:top; color:#475569; font-weight:600; background:#f8fafc;">Индикаторы риска (Red Flags)</td><td style="width:72%; padding:6px 8px; border-bottom:1px solid #f1f5f9; vertical-align:top; color:#0f172a;"><ul style="margin:0; padding-left:16px; color:#991b1b;">${d.kws.slice(0,5).map(k => `<li>${k}</li>`).join('')}</ul></td></tr><tr><td style="width:28%; padding:6px 8px; border-bottom:1px solid #f1f5f9; vertical-align:top; color:#475569; font-weight:600; background:#f8fafc;">Ключевые слова-триггеры</td><td style="width:72%; padding:6px 8px; border-bottom:1px solid #f1f5f9; vertical-align:top; color:#0f172a;">${d.kws.slice(0,10).map(k => `<span style="display:inline-block; background:#eff6ff; color:#1e40af; border:1px solid #bfdbfe; padding:1px 5px; border-radius:3px; font-size:8pt; margin-right:3px; margin-bottom:2px; font-family:monospace;">${k}</span>`).join(' ')}</td></tr></table>
+        <h2 style="font-size:10.5pt; font-weight:700; color:#0f172a; text-transform:uppercase; margin:10px 0 6px 0; padding-left:8px; border-left:3.5px solid #2563eb; letter-spacing:0.3px; position:relative; z-index:1;">3. Связанные сущности и показатели</h2>
+        <table style="width:100%; border-collapse:collapse; background:#fff; border:1px solid #e2e8f0; border-radius:6px; margin-bottom:10px; position:relative; z-index:1;"><tr><td style="width:28%; padding:6px 8px; border-bottom:1px solid #f1f5f9; vertical-align:top; color:#475569; font-weight:600; background:#f8fafc;">Агрегированная статистика</td><td style="width:72%; padding:6px 8px; border-bottom:1px solid #f1f5f9; vertical-align:top; color:#0f172a;">Всего публикаций: <b>${d.posts_count}</b> | Уровень риска: <b>${d.riskPct}</b></td></tr></table>
+        <h2 style="font-size:10.5pt; font-weight:700; color:#0f172a; text-transform:uppercase; margin:10px 0 6px 0; padding-left:8px; border-left:3.5px solid #2563eb; letter-spacing:0.3px; position:relative; z-index:1;">4. Доказательная база (Evidence)</h2>
+        <table style="width:100%; border-collapse:collapse; background:#fff; border:1px solid #e2e8f0; border-radius:6px; margin-bottom:10px; position:relative; z-index:1;"><tr><td style="width:28%; padding:6px 8px; border-bottom:1px solid #f1f5f9; vertical-align:top; color:#475569; font-weight:600; background:#f8fafc;">Скриншот фиксации</td><td style="width:72%; padding:6px 8px; border-bottom:1px solid #f1f5f9; vertical-align:top; color:#0f172a;"><a href="${firstScreenshotUrl}" style="color:#2563eb; text-decoration:none;">Ссылка на Supabase Storage Object (Скриншот)</a><br/><i>Примечание по обработке: Применено размытие (blur) для безопасности.</i></td></tr></table>
+        <h2 style="font-size:10.5pt; font-weight:700; color:#0f172a; text-transform:uppercase; margin:10px 0 6px 0; padding-left:8px; border-left:3.5px solid #2563eb; letter-spacing:0.3px; position:relative; z-index:1;">5. Экспертное заключение</h2>
+        <div style="background:#fff; border:1px solid #e2e8f0; padding:8px 10px; border-radius:6px; color:#1e293b; position:relative; z-index:1;">Данный объект идентифицирован как <b>высокорисковый элемент</b>. Рекомендуется внесение в черный список и направление уведомления в службу модерации.<br/><b>Основание:</b> ${d.reason}</div>
+        <div style="margin-top:15px; padding-top:8px; border-top:1px solid #cbd5e1; font-size:7.5pt; color:#94a3b8; text-align:justify; position:relative; z-index:1;"><b>Конфиденциально</b> | Сгенерировано аналитической платформой SERPYN OSINT | Документ предназначен для внутреннего использования и передачи в правоохранительные органы.</div>
+      </div>
+    `;
+
+    const container = document.createElement('div');
+    container.className = 'pdf-export-container';
+    container.innerHTML = htmlContent;
+    document.body.appendChild(container);
+
+    try {
+      // Ждём загрузки картинок (логотип), иначе html2canvas может
+      // отрендерить страницу раньше, чем логотип прогрузится => пустой лист.
+      await waitForImages(container);
+      await new Promise(r => setTimeout(r, 50)); // даём браузеру один кадр на layout
+
+      const canvas = await window.html2canvas(container, {
+        scale: 2,
+        useCORS: true,
+        allowTaint: true,
+        backgroundColor: '#ffffff',
+        imageTimeout: 5000,
+        logging: false,
+      });
+
+      if (!canvas.width || !canvas.height) {
+        throw new Error('html2canvas вернул пустой canvas (0x0)');
+      }
+
+      const imgData = canvas.toDataURL('image/png');
+      const pdf = new window.jspdf.jsPDF('p', 'mm', 'a4');
+      const pageWidth = pdf.internal.pageSize.getWidth();
+      const pageHeight = pdf.internal.pageSize.getHeight();
+      const imgWidthMm = pageWidth;
+      const imgHeightMm = (canvas.height * imgWidthMm) / canvas.width;
+
+      if (imgHeightMm <= pageHeight) {
+        // Помещается на одну страницу
+        pdf.addImage(imgData, 'PNG', 0, 0, imgWidthMm, imgHeightMm);
+      } else {
+        // Разбиваем длинное досье на несколько страниц A4
+        let heightLeftMm = imgHeightMm;
+        let positionMm = 0;
+        pdf.addImage(imgData, 'PNG', 0, positionMm, imgWidthMm, imgHeightMm);
+        heightLeftMm -= pageHeight;
+        while (heightLeftMm > 0) {
+          positionMm -= pageHeight;
+          pdf.addPage();
+          pdf.addImage(imgData, 'PNG', 0, positionMm, imgWidthMm, imgHeightMm);
+          heightLeftMm -= pageHeight;
+        }
+      }
+      pdf.save(`dossier_${d.id}.pdf`);
+    } catch (err) {
+      console.error('PDF generation error:', err);
+      alert('Не удалось сгенерировать PDF: ' + (err?.message || err) + '\nПроверьте консоль браузера (F12).');
+    } finally {
+      document.body.removeChild(container);
+      setIsGeneratingPDF(false);
+    }
+  }, [d, detail, screenshots, msgs, isGeneratingPDF, waitForImages]);
+
+  return(
+    <div style={{position:'fixed',inset:0,zIndex:50,background:'rgba(0,0,0,.55)',backdropFilter:'blur(2px)',display:'flex',flexDirection:'column'}} onClick={e=>{if(e.target===e.currentTarget)onClose()}}>
+      <div style={{flex:1,overflow:'auto',background:bg}}>
+        {/* Header */}
+        <div style={{position:'sticky',top:0,zIndex:10,background:cardBg,borderBottom:`1px solid ${border}`,padding:'12px 24px',display:'flex',alignItems:'center',gap:12,overflow:'hidden'}}>
+          <button onClick={onClose} style={{width:32,height:32,border:`1px solid ${border}`,borderRadius:8,background:'transparent',color:dark?'#fff':'#000',fontSize:16,display:'flex',alignItems:'center',justifyContent:'center',fontFamily:'inherit'}}>✕</button>
+          <span style={{fontSize:13,fontWeight:700,textTransform:'uppercase',letterSpacing:'0.05em',maxWidth:380,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>Досье · @{d.displayUsername||cleanUsername(d.username)}</span>
+          <Dot verdict={d.verdict}/><span style={{fontSize:12,fontWeight:700,color:vc(d.verdict),textTransform:'uppercase'}}>{d.verdict}</span>
+          
+          <div style={{marginLeft:'auto',flexShrink:0, display:'flex', gap:8}}>
+            {/* Кнопка включения редактирования */}
+            <button onClick={()=>setIsEditMode(!isEditMode)} style={{padding:'6px 12px', borderRadius:8, border:`1px solid ${border}`, background: isEditMode ? '#00C950' : 'transparent', color: isEditMode ? '#fff' : (dark?'#fff':'#000'), fontSize:11, fontFamily:'inherit', fontWeight:600, cursor:'pointer'}}>
+              {isEditMode ? '✏️ Готово' : '✏️ Ред.'}
+            </button>
+
+            {/* Кнопка PDF */}
+            <button onClick={handleDownloadPDF} disabled={isGeneratingPDF} style={{padding:'6px 12px',borderRadius:8,background:'#2563eb',color:'#fff',fontSize:11,textDecoration:'none',fontFamily:'inherit',fontWeight:600,border:'none',opacity:isGeneratingPDF?0.5:1}}>{isGeneratingPDF ? 'Генерация...' : '⬇ PDF'}</button>
+            
+            {/* Кнопка открыть */}
+            {(()=>{
+              const primaryLink = getPrimaryLink(d, detail) || d.url;
+              return primaryLink ? (
+              <a href={primaryLink} target="_blank" rel="noopener noreferrer" style={{padding:'6px 14px',borderRadius:8,background:dark?'#fff':'#000',color:dark?'#000':'#fff',fontSize:11,textDecoration:'none',fontFamily:'inherit',fontWeight:600,display:'inline-block',maxWidth:200,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>Открыть ↗</a>
+            ):(<span title={`Ссылка не найдена: нет url в БД и не удалось собрать из username (@${d.displayUsername||cleanUsername(d.username)}) для типа ${d.source_type}`} style={{padding:'6px 14px',borderRadius:8,border:`1px solid ${border}`,fontSize:11,color:muted}}>Нет ссылки</span>
+            )})()}
+          </div>
+        </div>
+ 
+        {/* Body */}
+        <div style={{maxWidth:1200,margin:'0 auto',padding:24,display:'grid',gridTemplateColumns:'1.4fr 0.9fr',gap:20}}>
+          {/* Left */}
+          <div style={{display:'flex',flexDirection:'column',gap:16}}>
+            <div style={{background:cardBg,border:`1px solid ${border}`,borderRadius:12,overflow:'hidden'}}>
+              <div style={{height:150,background:`linear-gradient(135deg,${vc(d.verdict)}44,#111)`,position:'relative'}}>
+                <div style={{position:'absolute',bottom:16,left:16,right:16,color:'#fff'}}>
+                  <div style={{fontSize:20,fontWeight:700}}>{d.title}</div>
+                  <div style={{fontSize:12,opacity:.8,marginTop:4}}>@{d.username}{d.participants>0&&` · ${d.participants.toLocaleString()} уч.`} · {d.source_type}</div>
+                </div>
+              </div>
+              {d.description&&<div style={{padding:'12px 16px'}}><div style={{fontSize:10,color:muted,textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:4}}>Описание</div><div style={{fontSize:12,lineHeight:1.5}}>{d.description}</div></div>}
+            </div>
+ 
+            <div style={{background:cardBg,border:`1px solid ${border}`,borderRadius:12,padding:20}}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}><div style={{fontSize:12,fontWeight:700,textTransform:'uppercase',letterSpacing:'0.1em'}}>Детекция</div><span style={{...sc(d.riskPct),padding:'4px 12px',borderRadius:8,fontSize:11,fontWeight:700,fontFamily:'inherit'}}>{d.verdict.toUpperCase()}</span></div>
+              <div style={{display:'flex',gap:20,flexWrap:'wrap'}}>
+                <div><div style={{fontSize:10,color:muted,textTransform:'uppercase',marginBottom:4}}>Risk Score</div><div style={{fontSize:40,fontWeight:700,color:vc(d.verdict),letterSpacing:'-0.02em'}}>{d.riskPct}</div><div style={{marginTop:8,height:8,borderRadius:6,background:dark?'#2a2a2a':'#f0f0f0',overflow:'hidden',width:120}}><div style={{height:'100%',background:vc(d.verdict),width:`${d.riskPct}%`,borderRadius:6,transition:'width .7s'}}/></div></div>
+                <div style={{flex:1}}>
+                  {d.cats.length>0&&<div style={{marginBottom:10}}><div style={{fontSize:10,color:muted,textTransform:'uppercase',marginBottom:4}}>Категории</div><div style={{display:'flex',flexWrap:'wrap',gap:4}}>{d.cats.map(c=><span key={c} style={{fontSize:10,padding:'2px 8px',border:`1px solid ${border}`,borderRadius:6,textTransform:'uppercase'}}>{c}</span>)}</div></div>}
+                  {d.kws.length>0&&<div style={{marginBottom:10}}><div style={{fontSize:10,color:muted,textTransform:'uppercase',marginBottom:4}}>Ключевые маркеры</div><div style={{display:'flex',flexWrap:'wrap',gap:4}}>{d.kws.map(k=><span key={k} style={{fontSize:10,padding:'2px 8px',borderRadius:6,background:'rgba(255,45,45,.1)',color:'#FF2D2D',border:'1px solid rgba(255,45,45,.2)'}}>{k}</span>)}</div></div>}
+                  <div><div style={{fontSize:10,color:muted,textTransform:'uppercase',marginBottom:4}}>Причина</div><div style={{fontSize:12,lineHeight:1.5,borderLeft:`3px solid ${vc(d.verdict)}`,paddingLeft:10}}>{d.reason}</div></div>
+                </div>
+              </div>
+            </div>
+ 
+            {/* Сообщения */}
+            <div style={{background:cardBg,border:`1px solid ${border}`,borderRadius:12,padding:20}}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:12}}><div style={{fontSize:12,fontWeight:700,textTransform:'uppercase',letterSpacing:'0.1em'}}>Сообщения ({msgs.length})</div>
+                <div style={{display:'flex',gap:4,alignItems:'center'}}>
+                  <button disabled={page===0} onClick={()=>setPage(p=>p-1)} style={{width:26,height:26,border:`1px solid ${border}`,borderRadius:6,background:'transparent',color:dark?'#fff':'#000',opacity:page===0?.3:1,fontFamily:'inherit',fontSize:13}}>←</button>
+                  <span style={{fontSize:11,color:muted,minWidth:40,textAlign:'center'}}>{page+1}/{totalPages}</span>
+                  <button disabled={page>=totalPages-1} onClick={()=>setPage(p=>p+1)} style={{width:26,height:26,border:`1px solid ${border}`,borderRadius:6,background:'transparent',color:dark?'#fff':'#000',opacity:page>=totalPages-1?.3:1,fontFamily:'inherit',fontSize:13}}>→</button>
+                </div>
+              </div>
+              {msgs.length===0&&<div style={{color:muted,fontSize:12,textAlign:'center',padding:'20px 0'}}>Сообщений нет</div>}
+              {msgs.slice(page*5,page*5+5).map((m,i)=>(
+                <div key={m.id||i} style={{border:`1px solid ${border}`,borderRadius:8,padding:10,marginBottom:8}}>
+                  <div style={{display:'flex',gap:8,fontSize:10,color:muted,marginBottom:4,flexWrap:'wrap'}}>{m.date&&<span>{new Date(m.date).toLocaleString('ru')}</span>}{m.views>0&&<span>👁 {m.views}</span>}{m.forwards>0&&<span>↗ {m.forwards}</span>}</div>
+                  <div style={{fontSize:12,lineHeight:1.5}}>{m.text||<span style={{color:muted,fontStyle:'italic'}}>— пусто —</span>}</div>
+                </div>
+              ))}
+            </div>
+ 
+            {/* ЗАМЕНА JSON НА КРАСИВОЕ ДОСЬЕ */}
+            {(dLoading||detail)&&(
+              <div style={{background:cardBg,border:`1px solid ${border}`,borderRadius:12,padding:20}}>
+                <div style={{fontSize:12,fontWeight:700,textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:12}}>
+                  Полное досье /channel/{d.id}/dossier
+                </div>
+                {dLoading&&<Spinner/>}
+                {detail&&!dLoading&&(
+                  <DossierView d={d} detail={detail} screenshots={screenshots} msgs={msgs} isEditMode={isEditMode} />
+                )}
+              </div>
+            )}
+          </div>
+ 
+          {/* Right (Скриншоты, связи, действия) */}
+          <div style={{display:'flex',flexDirection:'column',gap:16}}>
+            <div style={{background:cardBg,border:`1px solid ${border}`,borderRadius:12,padding:20}}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:12}}><div style={{fontSize:12,fontWeight:700,textTransform:'uppercase',letterSpacing:'0.1em'}}>Скриншоты {screenshots.length>0&&`(${screenshots.length})`}</div>
+                <label style={{fontSize:10,padding:'4px 8px',border:`1px solid ${border}`,borderRadius:6,cursor:'pointer',background:uploading?'#eee':'transparent',opacity:uploading?0.5:1}}>{uploading?'Загрузка...':'📷 Загрузить'}<input type="file" accept="image/*" style={{display:'none'}} disabled={uploading} onChange={async e=>{const file=e.target.files?.[0]; if(!file) return; setUploading(true); const url = await uploadViaServer(file, `${d.id}_${Date.now()}.png`); setUploading(false); if(url){ setStorageShots(prev=>[url, ...prev]); } else { alert('Не удалось загрузить'); }}}/></label>
+              </div>
+              {dLoading&&<Spinner/>}
+              {!dLoading&&screenshots.length===0&&(<div style={{color:muted,fontSize:11,textAlign:'center',padding:'16px 0'}}>Скриншотов в базе не найдено<br/><span style={{fontSize:9}}>Storage: {SCREENSHOT_BUCKET}/{d.id}</span></div>)}
+              {screenshots.length>0&&(<div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>{screenshots.map((url,i)=>(<a key={i} href={url} target="_blank" rel="noopener noreferrer" style={{aspectRatio:'4/3',borderRadius:8,border:`1px solid ${border}`,overflow:'hidden',display:'block',background:dark?'#1a1a1a':'#f0f0f0',position:'relative'}}><img src={url} alt={`screenshot ${i+1}`} loading="lazy" style={{width:'100%',height:'100%',objectFit:'cover',display:'block'}} onError={e=>{ const p=e.currentTarget.parentElement; e.currentTarget.style.display='none'; if(p){p.style.display='flex';p.style.alignItems='center';p.style.justifyContent='center';p.innerHTML='<span style=\'font-size:9px;color:'+muted+'\'>не загрузилось</span>';} }}/></a>))}</div>)}
+              <div style={{marginTop:10,fontSize:9,color:muted}}>Источник: evidence.storage_url + /channel/{d.id}/dossier</div>
+            </div>
+ 
+            {(()=>{ /* Блок связей */ 
+              let merged = {usernames:[...(d.links.usernames||[])], invites:[...(d.links.invites||[])], http:[...(d.links.http||[])], forwards:[...(d.forwards_from||[])]};
+              let primary=null;
+              if(detail){ const fromDetail = getLinksFromDetail(detail); merged.usernames.push(...fromDetail.usernames); merged.invites.push(...fromDetail.invites); merged.http.push(...fromDetail.http); merged.forwards.push(...fromDetail.forwards); primary=fromDetail.primary; }
+              const msgHttp = d.messages.flatMap(m=>[...(m.http_links||[]), m.url||[]]).filter(Boolean);
+              merged.http.push(...msgHttp);
+              merged.usernames = [...new Set(merged.usernames.map(s=>{ const h=extractHandle(String(s)); return h||String(s).replace('@','').split('?')[0].trim(); }).filter(Boolean))];
+              merged.invites = [...new Set(merged.invites.filter(Boolean))];
+              merged.http = [...new Set(merged.http.filter(Boolean))];
+              merged.forwards = [...new Set(merged.forwards.map(s=> typeof s==='string'?s:(s?.username||s?.name||'')).filter(Boolean))];
+              const hasAny = merged.usernames.length+merged.invites.length+merged.http.length+merged.forwards.length>0;
+              if(!hasAny) return (<div style={{background:cardBg,border:`1px solid ${border}`,borderRadius:12,padding:20}}><div style={{fontSize:12,fontWeight:700,textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:8}}>Связи из БД</div><div style={{fontSize:11,color:muted}}>Ссылок нет в БД</div></div>);
+              return (<div style={{background:cardBg,border:`2px solid ${d.verdict==='dangerous'?'#FF2D2D':border}`,borderRadius:12,padding:20}}><div style={{fontSize:12,fontWeight:700,textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:12}}>Связи из БД ({merged.usernames.length+merged.invites.length+merged.http.length})</div>
+                {[{label:'Ссылки на каналы',items:merged.usernames,color:'#FF2D2D',isLink:false},{label:'Инвайт ссылки',items:merged.invites,color:'#FFB800',isLink:true},{label:'Внешние ссылки',items:merged.http,color:'#888',isLink:true},{label:'Форварды из',items:merged.forwards,color:'#00C950',isLink:false}].filter(s=>s.items.length>0).map(s=>(
+                  <div key={s.label} style={{marginBottom:12}}><div style={{fontSize:10,color:muted,textTransform:'uppercase',marginBottom:6}}><span style={{color:s.color}}>●</span> {s.label} [{s.items.length}]</div>
+                    {s.items.slice(0,20).map((it,i)=>{ const str=String(it); const isHttp=str.startsWith('http'); const href=isHttp?str:`https://t.me/${str.replace('@','')}`; return (<a key={i} href={href} target="_blank" rel="noopener noreferrer" title={str} style={{display:'block',fontSize:11,padding:'5px 8px',border:`1px solid ${border}`,borderRadius:6,marginBottom:4,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',textDecoration:'none',color:dark?'#fff':'#000',background:dark?'#1a1a1a':'#fafafa'}}>{isHttp?cleanUrlForDisplay(str):`@${cleanUsername(str)}`} ↗</a>); })}
+                  </div>))}
+                <div style={{marginTop:6}}><a onClick={(e)=>{e.preventDefault();}} href="#graph" style={{fontSize:10,color:'#2563eb',textDecoration:'none'}}>ⓘ Полная карта связей — на вкладке «Граф связей»</a></div>
+                </div>);
+            })()}
+ 
+            <div style={{background:dark?'#fff':'#000',borderRadius:12,padding:20,color:dark?'#000':'#fff'}}>
+              <div style={{fontSize:10,textTransform:'uppercase',letterSpacing:'0.15em',opacity:.6,marginBottom:12}}>Действия</div>
+              {(()=>{ const primaryLink = getPrimaryLink(d, detail) || d.url; return primaryLink ? (<a href={primaryLink} target="_blank" rel="noopener noreferrer" style={{display:'block',textAlign:'center',padding:'10px',borderRadius:8,background:dark?'#000':'#fff',color:dark?'#fff':'#000',fontSize:12,textDecoration:'none',fontFamily:'inherit',fontWeight:700,marginBottom:8,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>Открыть ↗</a>):(<div style={{textAlign:'center',padding:'10px',borderRadius:8,border:'1px solid rgba(255,255,255,.2)',fontSize:11,opacity:.6,marginBottom:8}}>Ссылка не найдена в БД</div>)})()}
+              <div style={{fontSize:10,lineHeight:1.8,opacity:.6,marginTop:12}}><div>id: {d.id}</div><div>source: {d.source_type}</div><div>posts: {d.posts_count}</div></div>
+            </div>
+ 
+            <div style={{background:cardBg,border:`1px solid ${border}`,borderRadius:12,padding:16}}>
+              <div style={{fontSize:10,textTransform:'uppercase',letterSpacing:'0.1em',color:muted,marginBottom:8}}>Источник данных</div>
+              <div style={{fontSize:10,color:muted,lineHeight:1.8}}><div>GET /channels?limit=200</div><div>GET /suspicious?limit=500</div><div>GET /channel/{d.id}/dossier</div><div style={{marginTop:6,color:'#00C950'}}>✓ Реальные данные</div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── ГРАФ СВЯЗЕЙ ──────────────────────────────────────────────────────────────
+// Идея: backend уже хранит универсальные "сущности" (entities: CHANNEL, PERSON,
+// ACCOUNT, WALLET, PHONE, DOMAIN, ...) и "связи" между ними (relations: кто кого
+// продвигает/владеет/использует и т.д.) — см. таблицы entities/relations в
+// schema.sql и эндпоинт GET /graph в main.py. Этот компонент просто визуализирует
+// то, что туда прислал парсер вместе с /ingest (поля entities[] и relations[] —
+// см. example_ingest.json).
+const ENTITY_TYPE_META = {
+  CHANNEL:         {label:'Канал / страница',   color:'#2563eb'},
+  ACCOUNT:         {label:'Аккаунт (иная платформа)', color:'#7c3aed'},
+  PERSON:          {label:'Человек',             color:'#f97316'},
+  COMPANY:         {label:'Компания',            color:'#6366f1'},
+  PROJECT:         {label:'Проект/схема',        color:'#14b8a6'},
+  WEBSITE:         {label:'Сайт',                color:'#64748b'},
+  DOMAIN:          {label:'Домен',               color:'#64748b'},
+  PHONE:           {label:'Телефон',             color:'#10b981'},
+  EMAIL:           {label:'Email',               color:'#06b6d4'},
+  BANK_CARD:       {label:'Банковская карта',    color:'#ec4899'},
+  IBAN:            {label:'IBAN',                color:'#ec4899'},
+  WALLET:          {label:'Крипто-кошелёк',      color:'#f59e0b'},
+  USERNAME:        {label:'Username',            color:'#8b5cf6'},
+  ADDRESS:         {label:'Адрес',               color:'#84cc16'},
+  TELEGRAM_BOT:    {label:'Telegram-бот',        color:'#0ea5e9'},
+  WHATSAPP_NUMBER: {label:'WhatsApp',            color:'#22c55e'},
+  SOCIAL_MEDIA:    {label:'Соцсеть',             color:'#a855f7'},
+  CRYPTO_EXCHANGE: {label:'Крипто-биржа',        color:'#eab308'},
+  OTHER:           {label:'Другое',              color:'#94a3b8'},
+};
+const typeMeta = (t)=> ENTITY_TYPE_META[t] || ENTITY_TYPE_META.OTHER;
+
+function GraphView({dark,border,cardBg,muted,onOpenSource}){
+  const wrapRef = useRef(null);
+  const svgRef = useRef(null);
+  const [dims,setDims] = useState({w:900,h:640});
+  const [raw,setRaw] = useState({nodes:[],edges:[]});
+  const [wallets,setWallets] = useState([]);
+  const [loading,setLoading] = useState(true);
+  const [error,setError] = useState(null);
+  const [minRisk,setMinRisk] = useState(0);
+  const [selectedTypes,setSelectedTypes] = useState(null); // null = все
+  const [search,setSearch] = useState('');
+  const [selectedId,setSelectedId] = useState(null);
+  const [entityDetail,setEntityDetail] = useState(null);
+  const [detailLoading,setDetailLoading] = useState(false);
+  const [reveal,setReveal] = useState(false);
+  const [showHelp,setShowHelp] = useState(false);
+
+  const load = useCallback(()=>{
+    setLoading(true); setError(null);
+    Promise.all([
+      apiFetch('/graph?min_risk=0&limit=3000'),
+      apiFetch('/wallets?min_risk=0&limit=100').catch(()=>[]),
+    ]).then(([g,w])=>{
+      setRaw({nodes:g.nodes||[], edges:g.edges||[]});
+      setWallets(w||[]);
+      setLoading(false);
+    }).catch(e=>{ setError(e.message); setLoading(false); });
+  },[]);
+  useEffect(()=>{ load(); },[load]);
+
+  // Ресайз контейнера
+  useEffect(()=>{
+    if(!wrapRef.current) return;
+    const ro = new ResizeObserver(entries=>{
+      for(const en of entries){
+        const w = Math.max(320, en.contentRect.width);
+        const h = Math.max(420, en.contentRect.height);
+        setDims({w,h});
+      }
+    });
+    ro.observe(wrapRef.current);
+    return ()=>ro.disconnect();
+  },[]);
+
+  const presentTypes = useMemo(()=>[...new Set(raw.nodes.map(n=>n.type))].sort(),[raw.nodes]);
+  const activeTypes = selectedTypes===null ? new Set(presentTypes) : selectedTypes;
+
+  const {nodes, edges} = useMemo(()=>{
+    const nodeMap = {};
+    raw.nodes.forEach(n=>{
+      if((n.risk_score||0) < minRisk) return;
+      if(!activeTypes.has(n.type)) return;
+      nodeMap[n.id] = {...n};
+    });
+    const edges = raw.edges.filter(e=> nodeMap[e.source] && nodeMap[e.target]);
+    // подчищаем узлы без единой связи, если их слишком много (иначе граф превращается в "пыль")
+    return { nodes: Object.values(nodeMap), edges };
+  },[raw, minRisk, activeTypes]);
+
+  // ── D3 force-simulation, рисуем напрямую в SVG ──────────────────────────
+  useEffect(()=>{
+    if(!svgRef.current || typeof d3==='undefined') return;
+    const svg = d3.select(svgRef.current);
+    svg.selectAll('*').remove();
+    if(nodes.length===0) return;
+
+    const {w,h} = dims;
+    svg.attr('viewBox', [0,0,w,h]);
+
+    const g = svg.append('g');
+    const linkG = g.append('g').attr('stroke-opacity',0.55);
+    const nodeG = g.append('g');
+
+    const zoom = d3.zoom().scaleExtent([0.15,5]).on('zoom', (ev)=>{ g.attr('transform', ev.transform); });
+    svg.call(zoom);
+
+    const simNodes = nodes.map(n=>({...n}));
+    const idIndex = new Map(simNodes.map(n=>[n.id,n]));
+    const simLinks = edges.map(e=>({...e, source:e.source, target:e.target}));
+
+    const radius = (n)=> 8 + Math.min(1,Math.max(0,n.risk_score||0))*14 + Math.min(4, (n._deg||0));
+    // считаем степень узла (кол-во связей) — влияет на размер
+    simLinks.forEach(l=>{ const s=idIndex.get(l.source), t=idIndex.get(l.target); if(s) s._deg=(s._deg||0)+1; if(t) t._deg=(t._deg||0)+1; });
+
+    const sim = d3.forceSimulation(simNodes)
+      .force('link', d3.forceLink(simLinks).id(d=>d.id).distance(l=> 70 + (1-(l.confidence??1))*40).strength(0.5))
+      .force('charge', d3.forceManyBody().strength(-260))
+      .force('center', d3.forceCenter(w/2, h/2))
+      .force('collide', d3.forceCollide(d=>radius(d)+6));
+
+    const link = linkG.selectAll('line').data(simLinks).join('line')
+      .attr('stroke', l => (l.risk_score||0) >= 0.6 ? '#FF2D2D' : (dark?'#555':'#bbb'))
+      .attr('stroke-width', l => 1 + (l.confidence||0.5)*2);
+
+    const linkLabel = linkG.selectAll('text').data(simLinks).join('text')
+      .attr('font-size', 8)
+      .attr('fill', dark?'#999':'#888')
+      .attr('text-anchor','middle')
+      .text(l=> l.label || '');
+
+    const node = nodeG.selectAll('g.graph-node').data(simNodes, d=>d.id).join('g')
+      .attr('class','graph-node')
+      .style('cursor','pointer')
+      .call(d3.drag()
+        .on('start',(ev,d)=>{ if(!ev.active) sim.alphaTarget(0.25).restart(); d.fx=d.x; d.fy=d.y; })
+        .on('drag',(ev,d)=>{ d.fx=ev.x; d.fy=ev.y; })
+        .on('end',(ev,d)=>{ if(!ev.active) sim.alphaTarget(0); d.fx=null; d.fy=null; }))
+      .on('click',(ev,d)=>{ setSelectedId(d.id); });
+
+    node.append('circle')
+      .attr('r', d=>radius(d))
+      .attr('fill', d=> typeMeta(d.type).color)
+      .attr('stroke', d=> String(d.id)===String(selectedId) ? (dark?'#fff':'#000') : 'rgba(0,0,0,.15)')
+      .attr('stroke-width', d=> String(d.id)===String(selectedId) ? 3 : 1);
+
+    node.append('text')
+      .attr('dy', d=> radius(d)+11)
+      .attr('text-anchor','middle')
+      .attr('font-size', 9)
+      .attr('fill', dark?'#eee':'#111')
+      .text(d=> (d.label||'').length>18 ? (d.label||'').slice(0,18)+'…' : (d.label||''));
+
+    node.append('title').text(d=> `${typeMeta(d.type).label}: ${d.label}\nриск: ${Math.round((d.risk_score||0)*100)}`);
+
+    if(search.trim()){
+      const q = search.trim().toLowerCase();
+      node.style('opacity', d=> (d.label||'').toLowerCase().includes(q) ? 1 : 0.15);
+      link.style('opacity', 0.12);
+    }
+
+    sim.on('tick', ()=>{
+      link
+        .attr('x1', d=> (typeof d.source==='object'?d.source.x:idIndex.get(d.source)?.x) || 0)
+        .attr('y1', d=> (typeof d.source==='object'?d.source.y:idIndex.get(d.source)?.y) || 0)
+        .attr('x2', d=> (typeof d.target==='object'?d.target.x:idIndex.get(d.target)?.x) || 0)
+        .attr('y2', d=> (typeof d.target==='object'?d.target.y:idIndex.get(d.target)?.y) || 0);
+      linkLabel
+        .attr('x', d=> (((typeof d.source==='object'?d.source.x:idIndex.get(d.source)?.x)||0) + ((typeof d.target==='object'?d.target.x:idIndex.get(d.target)?.x)||0))/2)
+        .attr('y', d=> (((typeof d.source==='object'?d.source.y:idIndex.get(d.source)?.y)||0) + ((typeof d.target==='object'?d.target.y:idIndex.get(d.target)?.y)||0))/2);
+      node.attr('transform', d=> `translate(${d.x||0},${d.y||0})`);
+    });
+
+    return ()=>{ sim.stop(); };
+  },[nodes, edges, dims, dark, search, selectedId]);
+
+  // Подгружаем досье выбранной сущности
+  useEffect(()=>{
+    if(!selectedId){ setEntityDetail(null); return; }
+    setDetailLoading(true);
+    const headers = reveal ? {'X-Ingest-Token': INGEST_TOKEN} : undefined;
+    apiFetch(`/entity/${selectedId}/dossier${reveal?'?reveal=true':''}`, {headers})
+      .then(d=>{ setEntityDetail(d); setDetailLoading(false); })
+      .catch(()=>{ setEntityDetail(null); setDetailLoading(false); });
+  },[selectedId, reveal]);
+
+  const toggleType = (t)=>{
+    setSelectedTypes(prev=>{
+      const base = prev===null ? new Set(presentTypes) : new Set(prev);
+      if(base.has(t)) base.delete(t); else base.add(t);
+      return base;
+    });
+  };
+
+  if(loading) return <div style={{padding:24}}><Spinner/></div>;
+  if(error) return <div style={{padding:24,color:'#FF2D2D',fontSize:12}}>Ошибка загрузки /graph: {error}</div>;
+
+  return (
+    <div style={{padding:24,display:'flex',flexDirection:'column',height:'calc(100vh - 0px)'}}>
+      <div style={{display:'flex',alignItems:'center',gap:12,marginBottom:14,flexWrap:'wrap'}}>
+        <h1 style={{fontSize:18,fontWeight:700,textTransform:'uppercase',letterSpacing:'0.1em'}}>Граф связей</h1>
+        <span style={{fontSize:12,color:muted,border:`1px solid ${border}`,borderRadius:6,padding:'2px 8px'}}>{nodes.length} сущностей · {edges.length} связей</span>
+        <button onClick={()=>setShowHelp(s=>!s)} style={{fontSize:11,padding:'4px 10px',border:`1px solid ${border}`,borderRadius:8,background:'transparent',color:dark?'#fff':'#000',fontFamily:'inherit'}}>{showHelp?'Скрыть объяснение':'ⓘ Как это работает'}</button>
+        <button onClick={load} style={{marginLeft:'auto',fontSize:11,padding:'4px 10px',border:`1px solid ${border}`,borderRadius:8,background:'transparent',color:dark?'#fff':'#000',fontFamily:'inherit'}}>↻ Обновить</button>
+      </div>
+
+      {showHelp && (
+        <div style={{background:cardBg,border:`1px solid ${border}`,borderRadius:12,padding:16,marginBottom:14,fontSize:12,lineHeight:1.7}}>
+          <b>Как строится граф.</b> Каждая точка (узел) — это «сущность»: канал, человек, крипто-кошелёк,
+          телефон, домен и т.д. Линия (связь) появляется, если при отправке данных на <span className="code-text" style={{fontFamily:'monospace'}}>/ingest</span> в
+          массивах <span style={{fontFamily:'monospace'}}>entities[]</span> и <span style={{fontFamily:'monospace'}}>relations[]</span> одного поста
+          указаны две сущности и тип связи между ними (например «PROMOTES», «OWNS», «USES_WALLET»).
+          Один и тот же канал/кошелёк/телефон, встреченный в разных постах, автоматически "схлопывается" в один и тот же узел
+          (сервер ищет совпадение по нормализованному значению) — поэтому граф со временем сам достраивается и показывает,
+          где разные объявления и площадки на самом деле связаны одними и теми же людьми, кошельками или номерами.
+        </div>
+      )}
+
+      <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap',marginBottom:10}}>
+        <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Найти узел (имя, username, кошелёк...)" style={{flex:'1 1 220px',height:34,padding:'0 12px',background:dark?'#1a1a1a':'#fafaf8',border:`1px solid ${border}`,borderRadius:8,fontSize:12,fontFamily:'inherit',color:dark?'#fff':'#000',outline:'none'}}/>
+        <div style={{display:'flex',alignItems:'center',gap:6,fontSize:11,color:muted}}>
+          мин. риск
+          <input type="range" min="0" max="100" value={Math.round(minRisk*100)} onChange={e=>setMinRisk(Number(e.target.value)/100)} />
+          <span style={{width:26}}>{Math.round(minRisk*100)}</span>
+        </div>
+        {selectedTypes!==null && <button onClick={()=>setSelectedTypes(null)} style={{fontSize:11,padding:'4px 10px',border:`1px solid ${border}`,borderRadius:8,background:'transparent',color:dark?'#fff':'#000',fontFamily:'inherit'}}>Сбросить фильтр типов</button>}
+      </div>
+
+      <div style={{display:'flex',flexWrap:'wrap',gap:6,marginBottom:12}}>
+        {presentTypes.map(t=>{
+          const on = activeTypes.has(t);
+          const meta = typeMeta(t);
+          return (
+            <span key={t} className="graph-legend-chip" onClick={()=>toggleType(t)} style={{
+              background: on ? meta.color+'22' : 'transparent',
+              border: `1px solid ${on?meta.color:border}`,
+              color: on ? meta.color : muted,
+              opacity: on?1:0.55,
+            }}>
+              <span style={{width:8,height:8,borderRadius:'50%',background:meta.color,display:'inline-block'}}/>
+              {meta.label}
+            </span>
+          );
+        })}
+        {presentTypes.length===0 && <span style={{fontSize:11,color:muted}}>Сущностей пока нет — граф заполнится, когда парсер начнёт присылать entities[]/relations[] в /ingest</span>}
+      </div>
+
+      <div style={{flex:1,minHeight:420,display:'grid',gridTemplateColumns: selectedId? '1fr 320px' : '1fr', gap:14}}>
+        <div ref={wrapRef} className="graph-canvas-wrap" style={{background:cardBg,border:`1px solid ${border}`,borderRadius:12}}>
+          {nodes.length===0 ? (
+            <div style={{display:'flex',alignItems:'center',justifyContent:'center',height:'100%',color:muted,fontSize:12,textAlign:'center',padding:20}}>
+              Нет узлов по текущим фильтрам.<br/>Если сущностей в БД нет вовсе — добавьте entities[] и relations[] в payload /ingest (см. пример ниже в подсказке «Как это работает»).
+            </div>
+          ) : (
+            <svg ref={svgRef} width="100%" height={dims.h} style={{display:'block'}}/>
+          )}
+        </div>
+
+        {selectedId && (
+          <div style={{background:cardBg,border:`1px solid ${border}`,borderRadius:12,padding:16,overflowY:'auto',maxHeight:dims.h}}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:10}}>
+              <div style={{fontSize:11,fontWeight:700,textTransform:'uppercase',letterSpacing:'0.1em'}}>Карточка сущности</div>
+              <button onClick={()=>setSelectedId(null)} style={{border:'none',background:'transparent',fontSize:14,color:muted}}>✕</button>
+            </div>
+            {detailLoading && <Spinner/>}
+            {!detailLoading && entityDetail && (()=>{ const e = entityDetail.entity; const meta = typeMeta(e.entity_type); return (
+              <div style={{fontSize:12,lineHeight:1.6}}>
+                <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:8}}>
+                  <span style={{width:10,height:10,borderRadius:'50%',background:meta.color,display:'inline-block'}}/>
+                  <b style={{fontSize:13,wordBreak:'break-all'}}>{e.value || e.display_value}</b>
+                </div>
+                <div style={{color:muted,marginBottom:6}}>{meta.label}{e.category?` · ${e.category}`:''}{e.city?` · ${e.city}`:''}</div>
+                <div style={{marginBottom:10}}><RiskBadge score={Math.round((e.risk_score||0)*100)}/></div>
+
+                {e.entity_type==='WALLET' && !reveal && (
+                  <button onClick={()=>setReveal(true)} style={{fontSize:10,padding:'4px 8px',border:`1px solid ${border}`,borderRadius:6,background:'transparent',color:dark?'#fff':'#000',marginBottom:10}}>🔓 Показать полный адрес (требует токен)</button>
+                )}
+
+                <div style={{fontSize:10,textTransform:'uppercase',color:muted,marginTop:12,marginBottom:6}}>Связи ({entityDetail.relations?.length||0})</div>
+                {(!entityDetail.relations || entityDetail.relations.length===0) && <div style={{color:muted,fontSize:11}}>Связей не найдено</div>}
+                {(entityDetail.relations||[]).map(r=>(
+                  <div key={r.id} onClick={()=>setSelectedId(String(r.related_id))} style={{cursor:'pointer',display:'flex',alignItems:'center',gap:6,padding:'6px 8px',border:`1px solid ${border}`,borderRadius:6,marginBottom:6}}>
+                    <span style={{width:8,height:8,borderRadius:'50%',background:typeMeta(r.related_type).color,flexShrink:0}}/>
+                    <div style={{minWidth:0,flex:1}}>
+                      <div style={{fontSize:11,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{r.direction==='OUT'?'→':'←'} {r.related_value}</div>
+                      <div style={{fontSize:9,color:muted}}>{r.relation_type}{r.description?` · ${r.description}`:''}</div>
+                    </div>
+                  </div>
+                ))}
+
+                <div style={{fontSize:10,textTransform:'uppercase',color:muted,marginTop:12,marginBottom:6}}>Упоминания в постах ({entityDetail.posts?.length||0})</div>
+                {(entityDetail.posts||[]).slice(0,10).map(p=>(
+                  <div key={p.id} style={{padding:'6px 8px',border:`1px solid ${border}`,borderRadius:6,marginBottom:6}}>
+                    <div style={{fontSize:11,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{p.title||p.explanation||'Без заголовка'}</div>
+                    <div style={{fontSize:9,color:muted}}>{p.source_name} · {p.source_type}{p.role?` · роль: ${p.role}`:''}</div>
+                    {p.url && <a href={p.url} target="_blank" rel="noopener noreferrer" style={{fontSize:9,color:'#2563eb'}}>Открыть пост ↗</a>}
+                  </div>
+                ))}
+              </div>
+            );})()}
+            {!detailLoading && !entityDetail && <div style={{color:muted,fontSize:11}}>Не удалось загрузить карточку</div>}
+          </div>
+        )}
+      </div>
+
+      {wallets.length>0 && (
+        <div style={{marginTop:16,background:cardBg,border:`1px solid ${border}`,borderRadius:12,padding:16}}>
+          <div style={{fontSize:11,fontWeight:700,textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:10}}>💰 Крипто-кошельки в базе ({wallets.length})</div>
+          <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(240px,1fr))',gap:8}}>
+            {wallets.map(w=>(
+              <div key={w.id} onClick={()=>setSelectedId(String(w.id))} style={{cursor:'pointer',border:`1px solid ${border}`,borderRadius:8,padding:'8px 10px',display:'flex',alignItems:'center',gap:8}}>
+                <span style={{width:8,height:8,borderRadius:'50%',background:'#f59e0b',flexShrink:0}}/>
+                <div style={{minWidth:0,flex:1}}>
+                  <div style={{fontSize:11,fontFamily:'monospace',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{w.display_value}</div>
+                  <div style={{fontSize:9,color:muted}}>{w.mention_count} упоминаний{w.category?` · ${w.category}`:''}</div>
+                </div>
+                <RiskBadge score={Math.round((w.risk_score||0)*100)}/>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+ 
+// ── Main App ──────────────────────────────────────────────────────────────────
+function App(){
+  const [dark,setDark]=useState(false);
+  const [tab,setTab]=useState('overview');
+  const [dossiers,setDossiers]=useState([]);
+  const [alerts,setAlerts]=useState([]);
+  const [liveItems,setLiveItems]=useState([]);
+  const [loading,setLoading]=useState(true);
+  const [error,setError]=useState(null);
+  const [search,setSearch]=useState('');
+  const [filterVerdict,setFilterVerdict]=useState('all');
+  const [filterSource,setFilterSource]=useState('all');
+  const [sortBy,setSortBy]=useState('risk');
+  const [selected,setSelected]=useState(null);
+  const [lastSync,setLastSync]=useState(null);
+  const [syncing,setSyncing]=useState(false);
+ 
+  const load=useCallback((silent=false)=>{
+    if(silent){ setSyncing(true); } else { setLoading(true); }
+    setError(null);
+    Promise.all([loadAll(),apiFetch('/alerts?unread_only=false&limit=50').catch(()=>[])])
+      .then(([d,a])=>{
+        setDossiers(d);
+        setAlerts(a);
+        const items=a.slice(0,30).map((al,i)=>({
+          id:String(al.id||i),
+          time:new Date(al.created_at||Date.now()).toLocaleTimeString('ru'),
+          title:al.title||al.message||'—',
+          risk:Math.round((al.risk_score||0)*100),
+          username:al.source_username||'—',
+        }));
+        setLiveItems(items);
+        setLoading(false);
+        setSyncing(false);
+        setLastSync(new Date());
+      })
+      .catch(e=>{setError(e.message);setLoading(false);setSyncing(false);});
+  },[]);
+ 
+  useEffect(()=>{ load(false); },[load]);
+  useEffect(()=>{ const t=setInterval(()=>{ load(true); },20000); return ()=>clearInterval(t); },[load]);
+  useEffect(()=>{
+    const t=setInterval(()=>{
+      apiFetch('/alerts?unread_only=false&limit=50').then(a=>{
+        setAlerts(a);
+        setLiveItems(prev=>{
+          const newItems=a.slice(0,5).map((al,i)=>({
+            id:String(al.id||i),time:new Date(al.created_at||Date.now()).toLocaleTimeString('ru'),
+            title:al.title||al.message||'—',risk:Math.round((al.risk_score||0)*100),username:al.source_username||'—',
+          }));
+          const ids=new Set(prev.map(x=>x.id));
+          return [...newItems.filter(x=>!ids.has(x.id)),...prev].slice(0,60);
+        });
+      }).catch(()=>{});
+    },15000);
+    return ()=>clearInterval(t);
+  },[]);
+ 
+  const stats=useMemo(()=>({ total:dossiers.length, dangerous:dossiers.filter(d=>d.verdict==='dangerous').length, suspicious:dossiers.filter(d=>d.verdict==='suspicious').length, safe:dossiers.filter(d=>d.verdict==='safe').length }),[dossiers]);
+  const filtered=useMemo(()=>{
+    let list=[...dossiers];
+    if(search){const q=search.toLowerCase();list=list.filter(d=>d.username.toLowerCase().includes(q)||d.title.toLowerCase().includes(q)||d.cats.some(c=>c.toLowerCase().includes(q)));}
+    if(filterVerdict!=='all')list=list.filter(d=>d.verdict===filterVerdict);
+    if(filterSource!=='all')list=list.filter(d=>d.source_type===filterSource);
+    if(sortBy==='risk')list.sort((a,b)=>b.riskPct-a.riskPct);
+    else if(sortBy==='participants')list.sort((a,b)=>b.participants-a.participants);
+    return list;
+  },[dossiers,search,filterVerdict,filterSource,sortBy]);
+ 
+  const analytics=useMemo(()=>{
+    const dayMap={}; const now=new Date(); for(let i=13;i>=0;i--){ const d=new Date(now);d.setDate(d.getDate()-i); dayMap[d.toISOString().slice(0,10)]=0; }
+    const days7=[]; for(let i=6;i>=0;i--){ const d=new Date(now);d.setDate(d.getDate()-i); days7.push(d.toISOString().slice(0,10)); }
+    const spark={total:days7.map(()=>0),dangerous:days7.map(()=>0),suspicious:days7.map(()=>0),safe:days7.map(()=>0)};
+    const catMap={},kwMap={},srcMap={}; let totalViews=0,totalForwards=0,totalPosts=0,dangerousReach=0;
+    dossiers.forEach(d=>{ srcMap[d.source_type]=(srcMap[d.source_type]||0)+1; d.cats.forEach(c=>{catMap[c]=(catMap[c]||0)+1;}); d.kws.forEach(k=>{kwMap[k]=(kwMap[k]||0)+1;}); if(d.verdict==='dangerous')dangerousReach+=d.participants||0; d.messages.forEach(m=>{ totalPosts++; totalViews+=m.views||0; totalForwards+=m.forwards||0; if(m.date){ const key=new Date(m.date).toISOString().slice(0,10); if(key in dayMap)dayMap[key]++; const idx7=days7.indexOf(key); if(idx7>-1){spark.total[idx7]++;spark[d.verdict][idx7]++;}} }); });
+    const days=Object.entries(dayMap); const topCats=Object.entries(catMap).sort((a,b)=>b[1]-a[1]).slice(0,8); const catTotal=Object.values(catMap).reduce((a,b)=>a+b,0)||1;
+    
+    const topCatsPct=Object.entries(catMap).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([cat,val])=>({cat,val,pct:Math.round(val/catTotal*100)}));
+    
+    const topKws=Object.entries(kwMap).sort((a,b)=>b[1]-a[1]).slice(0,10);
+    const sources=Object.entries(srcMap).sort((a,b)=>b[1]-a[1]);
+    const topByParticipants=[...dossiers].sort((a,b)=>b.participants-a.participants).slice(0,8);
+    const avgPostsPerChannel=dossiers.length>0?(totalPosts/dossiers.length):0;
+    const todayCounts={total:spark.total[6],dangerous:spark.dangerous[6],suspicious:spark.suspicious[6],safe:spark.safe[6]};
+    return{days,days7,spark,todayCounts,topCats,topCatsPct,topKws,sources,topByParticipants,totalViews,totalForwards,totalPosts,avgPostsPerChannel,dangerousReach};
+  },[dossiers]);
+ 
+  const bg=dark?'#0a0a0a':'#f8f8f6'; const cardBg=dark?'#121212':'#fff'; const border=dark?'#2a2a2a':'#e5e5e5'; const muted=dark?'#888':'#666'; const sidebarBg=dark?'#0a0a0a':'#f8f8f6';
+  const navItems=[
+    {k:'overview',label:'Обзор',count:null},
+    {k:'dossiers',label:'Досье',count:stats.total},
+    {k:'graph',label:'Граф связей',count:null},
+    {k:'analytics',label:'Аналитика',count:null},
+    {k:'live',label:'LIVE лента',count:alerts.length,pulse:true},
+  ];
+ 
+  if(loading) return(<div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:bg,color:dark?'#fff':'#000',fontFamily:'JetBrains Mono,monospace'}}><div style={{textAlign:'center'}}><div style={{fontSize:22,fontWeight:700,letterSpacing:'-0.02em',marginBottom:16}}>СЕРПІН</div><Spinner/><div style={{marginTop:12,color:muted,fontSize:11}}>Подключение к API...</div><div style={{marginTop:4,color:muted,fontSize:10}}>{API}</div></div></div>);
+  if(error) return(<div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:bg,color:dark?'#fff':'#000',fontFamily:'JetBrains Mono,monospace'}}><div style={{textAlign:'center',maxWidth:480,padding:32}}><div style={{fontSize:36,marginBottom:12}}>⚠️</div><div style={{fontSize:15,fontWeight:700,marginBottom:10}}>Ошибка подключения к API</div><div style={{fontSize:12,color:'#FF2D2D',marginBottom:12}}>{error}</div><div style={{fontSize:11,color:muted,marginBottom:20}}>{API}</div><button onClick={load} style={{padding:'10px 24px',background:dark?'#fff':'#000',color:dark?'#000':'#fff',border:'none',borderRadius:8,fontSize:12,fontFamily:'inherit',fontWeight:600}}>Повторить</button></div></div>);
+ 
+  return(
+    <div style={{minHeight:'100vh',display:'flex',fontFamily:'JetBrains Mono,monospace',background:bg,color:dark?'#fff':'#000'}}>
+      <aside style={{width:220,flexShrink:0,borderRight:`1px solid ${border}`,display:'flex',flexDirection:'column',background:sidebarBg,position:'sticky',top:0,height:'100vh',overflow:'hidden'}}>
+        <div style={{padding:'20px 16px',borderBottom:`1px solid ${border}`}}><div style={{fontSize:20,fontWeight:700,letterSpacing:'-0.02em'}}>СЕРПІН</div><div style={{fontSize:10,letterSpacing:'0.2em',opacity:.6,marginTop:4}}>PYRAMID GUARD KZ</div>
+          <div style={{marginTop:10,display:'flex',alignItems:'center',gap:6,fontSize:10}}><span style={{width:7,height:7,borderRadius:'50%',background:'#00C950',animation:'pulseLive 1.5s infinite',display:'inline-block'}}/><span style={{color:muted}}>СИСТЕМА АКТИВНА</span></div>
+          <div style={{marginTop:4,fontSize:10,color:muted}}>{stats.total} каналов в базе</div>
+          <div style={{marginTop:6,display:'flex',alignItems:'center',gap:6,fontSize:9,color:muted}}><span>{syncing?'синхронизация…':lastSync?`обновлено ${lastSync.toLocaleTimeString('ru')}`:''}</span><button onClick={()=>load(true)} disabled={syncing} title="Обновить сейчас" style={{marginLeft:'auto',border:`1px solid ${border}`,background:'transparent',color:'inherit',borderRadius:6,padding:'2px 6px',fontSize:10,fontFamily:'inherit',cursor:syncing?'default':'pointer',opacity:syncing?.5:1,lineHeight:1}}>{syncing?'⟳':'↻'}</button></div>
+        </div>
+        <nav style={{padding:8,flex:1,overflowY:'auto'}}>{navItems.map(item=>(<button key={item.k} onClick={()=>setTab(item.k)} style={{width:'100%',textAlign:'left',padding:'10px 12px',borderRadius:8,border:`1px solid ${tab===item.k?(dark?'#fff':'#000'):'transparent'}`,background:tab===item.k?(dark?'#fff':'#000'):'transparent',color:tab===item.k?(dark?'#000':'#fff'):(dark?'#fff':'#000'),cursor:'pointer',fontSize:12,fontFamily:'inherit',display:'flex',alignItems:'center',justifyContent:'space-between',gap:4,marginBottom:2}}><span style={{textTransform:'uppercase',letterSpacing:'0.1em',fontWeight:600}}>{item.label}</span><div style={{display:'flex',alignItems:'center',gap:4}}>{item.count!==null&&<span style={{fontSize:10,border:`1px solid ${tab===item.k?'currentColor':border}`,borderRadius:6,padding:'1px 5px'}}>{item.count}</span>}{item.pulse&&<span style={{width:6,height:6,borderRadius:'50%',background:'#FF2D2D',animation:'pulseLive 1s infinite',display:'inline-block'}}/>}</div></button>))}</nav>
+        <div style={{padding:'12px 16px',borderTop:`1px solid ${border}`}}><button onClick={()=>setDark(!dark)} style={{width:'100%',padding:'8px 12px',border:`1px solid ${border}`,borderRadius:8,background:'transparent',color:dark?'#fff':'#000',cursor:'pointer',fontSize:11,fontFamily:'inherit',textTransform:'uppercase',letterSpacing:'0.1em'}}>{dark?'☀ Светлая':'☾ Тёмная'}</button><div style={{marginTop:10,fontSize:10,color:muted,lineHeight:1.7}}><div style={{overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>serpyn-new-serpyn.up.railway.app</div><div style={{marginTop:2,color:'#00C950'}}>✓ Live данные</div></div></div>
+      </aside>
+ 
+      <main style={{flex:1,minWidth:0,overflow:'auto'}}>
+        {tab==='overview'&&(<div style={{padding:24}}><h1 style={{fontSize:18,fontWeight:700,textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:20}}>Обзор системы</h1>
+          <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(200px,1fr))',gap:12,marginBottom:16}}>{[{key:'total',label:'Всего каналов',value:stats.total,color:'',bar:dark?'rgba(255,255,255,.35)':'rgba(0,0,0,.35)'},{key:'dangerous',label:'Опасных',value:stats.dangerous,color:'#FF2D2D',bar:'#FF2D2D'},{key:'suspicious',label:'Подозрительных',value:stats.suspicious,color:'#FFB800',bar:'#FFB800'},{key:'safe',label:'Безопасных',value:stats.safe,color:'#00C950',bar:'#00C950'}].map((s,i)=>{const arr=analytics.spark[s.key]||[];const maxV=Math.max(1,...arr);const today=analytics.todayCounts[s.key]||0;return(<div key={i} style={{background:cardBg,border:`1px solid ${border}`,borderRadius:12,padding:20,position:'relative',overflow:'hidden'}}><div style={{fontSize:10,textTransform:'uppercase',letterSpacing:'0.15em',color:muted}}>{s.label}</div><div style={{fontSize:36,fontWeight:700,marginTop:8,color:s.color||'inherit',letterSpacing:'-0.02em'}}>{s.value}</div><div style={{fontSize:10,marginTop:6,color:muted,border:`1px solid ${border}`,borderRadius:6,padding:'2px 6px',display:'inline-block'}}>{today>0?`+${today} постов сегодня`:'нет постов сегодня'}</div><div style={{position:'absolute',right:14,top:16,display:'flex',alignItems:'flex-end',gap:2,height:26}}>{arr.map((v,j)=>(<div key={j} style={{width:3,borderRadius:1,background:s.bar,height:Math.max(2,v/maxV*26),opacity:j===arr.length-1?1:.55}}/>))}</div></div>);})}</div>
+          <div style={{display:'grid',gridTemplateColumns:'1.6fr 1fr',gap:12,marginBottom:16}}><div style={{background:cardBg,border:`1px solid ${border}`,borderRadius:12,padding:20}}><div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:14}}><div style={{fontSize:11,textTransform:'uppercase',letterSpacing:'0.15em',fontWeight:700}}>Активность — постов в день</div><div style={{fontSize:10,color:muted}}>14 дней</div></div>{analytics.totalPosts===0?(<div style={{color:muted,fontSize:12,textAlign:'center',padding:'30px 0'}}>Нет постов с датами для графика</div>):(<div style={{display:'flex',alignItems:'flex-end',gap:6,height:110}}>{analytics.days.map(([key,val])=>{const maxDay=Math.max(1,...analytics.days.map(([,v])=>v));const filled=Math.round(val/maxDay*10);const d=new Date(key);return(<div key={key} title={`${key}: ${val}`} style={{flex:1,display:'flex',flexDirection:'column',alignItems:'center',gap:4}}><div style={{display:'flex',flexDirection:'column-reverse',gap:2,height:70,justifyContent:'flex-start'}}>{Array.from({length:10}).map((_,r)=>(<div key={r} style={{width:10,height:5,borderRadius:1,background:r<filled?(dark?'#fff':'#000'):'transparent',border:r<filled?'none':`1px solid ${border}`}}/>))}</div><div style={{fontSize:8,color:muted}}>{d.toLocaleDateString('ru',{day:'2-digit',month:'2-digit'})}</div></div>);})}</div>)}</div>
+          <div style={{display:'flex',flexDirection:'column',gap:12}}>
+            <div style={{background:cardBg,border:`1px solid ${border}`,borderRadius:12,padding:16,flex:1}}>
+              <div style={{fontSize:11,textTransform:'uppercase',letterSpacing:'0.15em',fontWeight:700,marginBottom:10}}>Топ категорий нелегала</div>
+              {analytics.topCatsPct.length===0&&<div style={{color:muted,fontSize:11,textAlign:'center',padding:'12px 0'}}>Категории не определены</div>}
+              {analytics.topCatsPct.map(c=>{
+                 const maxVal = Math.max(1, ...analytics.topCatsPct.map(x => x.val));
+                 return (<div key={c.cat} style={{display:'flex',alignItems:'center',gap:8,marginBottom:8}}>
+                  <div style={{fontSize:10,width:100,textTransform:'uppercase',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',flexShrink:0}}>{c.cat}</div>
+                  <div style={{flex:1,height:8,borderRadius:4,border:`1px solid ${border}`,overflow:'hidden'}}>
+                    <div style={{height:'100%',width:`${(c.val/maxVal)*100}%`,background:dark?'#fff':'#000'}}/>
+                  </div>
+                  <div style={{fontSize:10,width:32,textAlign:'right',flexShrink:0}}>{c.val}</div>
+                </div>);
+              })}
+            </div>
+            <div style={{background:dark?'#fff':'#000',color:dark?'#000':'#fff',borderRadius:12,padding:16}}><div style={{fontSize:10,textTransform:'uppercase',letterSpacing:'0.15em',opacity:.7}}>Суммарный охват опасных</div><div style={{fontSize:24,fontWeight:700,marginTop:6}}>{analytics.dangerousReach.toLocaleString()} участников</div><div style={{display:'flex',gap:2,marginTop:10}}>{Array.from({length:24}).map((_,i)=>(<div key={i} style={{height:4,flex:1,borderRadius:2,background:dark?'rgba(0,0,0,.2)':'rgba(255,255,255,.2)',opacity:stats.total>0&&i<Math.round(stats.dangerous/stats.total*24)?1:.3}}/>))}</div></div></div></div>
+          {stats.total>0&&(<div style={{background:cardBg,border:`1px solid ${border}`,borderRadius:12,padding:20,marginBottom:20}}><div style={{fontSize:11,textTransform:'uppercase',letterSpacing:'0.15em',color:muted,marginBottom:12}}>Распределение угроз</div><div style={{display:'flex',height:24,borderRadius:8,overflow:'hidden',gap:2}}>{stats.dangerous>0&&<div style={{flex:stats.dangerous,background:'#FF2D2D',display:'flex',alignItems:'center',justifyContent:'center',fontSize:10,color:'#fff',fontWeight:700}}>{Math.round(stats.dangerous/stats.total*100)}%</div>}{stats.suspicious>0&&<div style={{flex:stats.suspicious,background:'#FFB800',display:'flex',alignItems:'center',justifyContent:'center',fontSize:10,color:'#000',fontWeight:700}}>{Math.round(stats.suspicious/stats.total*100)}%</div>}{stats.safe>0&&<div style={{flex:stats.safe,background:'#00C950',display:'flex',alignItems:'center',justifyContent:'center',fontSize:10,color:'#000',fontWeight:700}}>{Math.round(stats.safe/stats.total*100)}%</div>}</div><div style={{display:'flex',gap:16,marginTop:10,fontSize:11,flexWrap:'wrap'}}><span><span style={{color:'#FF2D2D'}}>●</span> Опасные</span><span><span style={{color:'#FFB800'}}>●</span> Подозрительные</span><span><span style={{color:'#00C950'}}>●</span> Безопасные</span></div></div>)}
+          <div style={{background:cardBg,border:`1px solid ${border}`,borderRadius:12,padding:20}}><div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:16}}><div style={{fontSize:11,textTransform:'uppercase',letterSpacing:'0.15em',color:muted}}>Досье — последние по риску</div><button onClick={()=>setTab('dossiers')} style={{fontSize:11,padding:'6px 12px',border:`1px solid ${border}`,borderRadius:8,background:'transparent',color:dark?'#fff':'#000',cursor:'pointer',fontFamily:'inherit'}}>Все досье ({stats.total}) →</button></div><div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(260px,1fr))',gap:12}}>{[...dossiers].sort((a,b)=>b.riskPct-a.riskPct).slice(0,6).map(d=>(<DCard key={d.id} d={d} dark={dark} border={border} onOpen={setSelected}/>))}</div>{stats.total===0&&<div style={{color:muted,fontSize:12,textAlign:'center',padding:'20px 0'}}>Данных пока нет. Запусти парсер.</div>}</div></div>)}
+        {tab==='dossiers'&&(<div style={{padding:24}}><div style={{display:'flex',alignItems:'center',gap:12,marginBottom:20,flexWrap:'wrap'}}><h1 style={{fontSize:18,fontWeight:700,textTransform:'uppercase',letterSpacing:'0.1em'}}>Досье каналов</h1><span style={{fontSize:12,color:muted,border:`1px solid ${border}`,borderRadius:6,padding:'2px 8px'}}>{filtered.length}</span></div><div style={{background:cardBg,border:`1px solid ${border}`,borderRadius:12,padding:16,marginBottom:16}}><div style={{display:'flex',gap:8,flexWrap:'wrap',alignItems:'center'}}><input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Поиск: @username, название, категория..." style={{flex:'1 1 200px',height:36,padding:'0 12px',background:dark?'#1a1a1a':'#fafaf8',border:`1px solid ${border}`,borderRadius:8,fontSize:12,fontFamily:'inherit',color:dark?'#fff':'#000',outline:'none'}}/><select value={filterVerdict} onChange={e=>setFilterVerdict(e.target.value)} style={{height:36,padding:'0 8px',background:dark?'#1a1a1a':'#fafaf8',border:`1px solid ${border}`,borderRadius:8,fontSize:11,fontFamily:'inherit',color:dark?'#fff':'#000'}}><option value="all">Все вердикты</option><option value="dangerous">🔴 Опасные</option><option value="suspicious">🟡 Подозрительные</option><option value="safe">🟢 Безопасные</option></select><select value={filterSource} onChange={e=>setFilterSource(e.target.value)} style={{height:36,padding:'0 8px',background:dark?'#1a1a1a':'#fafaf8',border:`1px solid ${border}`,borderRadius:8,fontSize:11,fontFamily:'inherit',color:dark?'#fff':'#000'}}><option value="all">Все источники</option><option value="TELEGRAM">Telegram</option><option value="YOUTUBE">YouTube</option><option value="MANUAL">Ручной ввод</option><option value="OTHER">Другое</option></select><select value={sortBy} onChange={e=>setSortBy(e.target.value)} style={{height:36,padding:'0 8px',background:dark?'#1a1a1a':'#fafaf8',border:`1px solid ${border}`,borderRadius:8,fontSize:11,fontFamily:'inherit',color:dark?'#fff':'#000'}}><option value="risk">По риску ↓</option><option value="participants">По участникам ↓</option></select>{(search||filterVerdict!=='all'||filterSource!=='all')&&(<button onClick={()=>{setSearch('');setFilterVerdict('all');setFilterSource('all');}} style={{height:36,padding:'0 12px',border:`1px solid ${border}`,borderRadius:8,background:'transparent',color:dark?'#fff':'#000',cursor:'pointer',fontSize:11,fontFamily:'inherit'}}>Сброс</button>)}</div></div><div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(290px,1fr))',gap:12}}>{filtered.map((d,i)=>(<DCard key={d.id} d={d} dark={dark} border={border} onOpen={setSelected}/>))}</div>{filtered.length===0&&<div style={{textAlign:'center',padding:'60px 0',color:muted,fontSize:13}}>Ничего не найдено</div>}</div>)}
+        {tab==='graph'&&(<GraphView dark={dark} border={border} cardBg={cardBg} muted={muted}/>)}
+        {tab==='analytics'&&(()=>{const maxDay=Math.max(1,...analytics.days.map(([,v])=>v));const maxCat=Math.max(1,...analytics.topCats.map(([,v])=>v));const maxKw=Math.max(1,...analytics.topKws.map(([,v])=>v));const maxSrc=Math.max(1,...analytics.sources.map(([,v])=>v));const srcLabel={TELEGRAM:'Telegram',YOUTUBE:'YouTube',MANUAL:'Ручной ввод',OTHER:'Другое'};return(<div style={{padding:24}}><div style={{display:'flex',alignItems:'center',gap:12,marginBottom:20,flexWrap:'wrap'}}><h1 style={{fontSize:18,fontWeight:700,textTransform:'uppercase',letterSpacing:'0.1em'}}>Аналитика</h1><span style={{fontSize:11,color:muted}}>расчёт на основе реальных данных из /channels и /suspicious</span></div><div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(180px,1fr))',gap:12,marginBottom:20}}>{[{label:'Постов проанализировано',value:analytics.totalPosts},{label:'Ср. постов на канал',value:analytics.avgPostsPerChannel.toFixed(1)},{label:'Суммарные просмотры',value:analytics.totalViews.toLocaleString()},{label:'Суммарные репосты',value:analytics.totalForwards.toLocaleString()}].map((s,i)=>(<div key={i} style={{background:cardBg,border:`1px solid ${border}`,borderRadius:12,padding:20}}><div style={{fontSize:10,textTransform:'uppercase',letterSpacing:'0.15em',color:muted}}>{s.label}</div><div style={{fontSize:28,fontWeight:700,marginTop:8,letterSpacing:'-0.02em'}}>{s.value}</div></div>))}</div><div style={{background:cardBg,border:`1px solid ${border}`,borderRadius:12,padding:20,marginBottom:20}}><div style={{fontSize:11,textTransform:'uppercase',letterSpacing:'0.15em',color:muted,marginBottom:16}}>Активность — постов в день (14 дней)</div>{analytics.totalPosts===0?(<div style={{color:muted,fontSize:12,textAlign:'center',padding:'20px 0'}}>Нет постов с датами для построения графика</div>):(<div style={{display:'flex',alignItems:'flex-end',gap:6,height:140}}>{analytics.days.map(([key,val])=>{const d=new Date(key);return(<div key={key} title={`${key}: ${val}`} style={{flex:1,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'flex-end',height:'100%'}}><div style={{fontSize:9,color:muted,marginBottom:4}}>{val>0?val:''}</div><div style={{width:'100%',maxWidth:22,height:`${Math.max(2,val/maxDay*100)}%`,background:val>0?'#FF2D2D':(dark?'#2a2a2a':'#eee'),borderRadius:'4px 4px 0 0',transition:'height .5s'}}/><div style={{fontSize:8,color:muted,marginTop:6,writingMode:'vertical-rl',transform:'rotate(180deg)',height:34}}>{d.toLocaleDateString('ru',{day:'2-digit',month:'2-digit'})}</div></div>);})}</div>)}</div><div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:20,marginBottom:20}}><div style={{background:cardBg,border:`1px solid ${border}`,borderRadius:12,padding:20}}><div style={{fontSize:11,textTransform:'uppercase',letterSpacing:'0.15em',color:muted,marginBottom:16}}>Категории нарушений</div>{analytics.topCats.length===0&&<div style={{color:muted,fontSize:12,textAlign:'center',padding:'20px 0'}}>Категории не определены</div>}{analytics.topCats.map(([cat,val])=>(<div key={cat} style={{marginBottom:10}}><div style={{display:'flex',justifyContent:'space-between',fontSize:11,marginBottom:4}}><span style={{textTransform:'uppercase'}}>{cat}</span><span style={{color:muted}}>{val}</span></div><div style={{height:6,borderRadius:4,background:dark?'#2a2a2a':'#f0f0f0',overflow:'hidden'}}><div style={{height:'100%',width:`${val/maxCat*100}%`,background:'#FF2D2D',borderRadius:4}}/></div></div>))}</div><div style={{background:cardBg,border:`1px solid ${border}`,borderRadius:12,padding:20}}><div style={{fontSize:11,textTransform:'uppercase',letterSpacing:'0.15em',color:muted,marginBottom:16}}>Топ ключевых маркеров</div>{analytics.topKws.length===0&&<div style={{color:muted,fontSize:12,textAlign:'center',padding:'20px 0'}}>Маркеры не найдены</div>}{analytics.topKws.map(([kw,val])=>(<div key={kw} style={{marginBottom:10}}><div style={{display:'flex',justifyContent:'space-between',fontSize:11,marginBottom:4}}><span>{kw}</span><span style={{color:muted}}>{val}</span></div><div style={{height:6,borderRadius:4,background:dark?'#2a2a2a':'#f0f0f0',overflow:'hidden'}}><div style={{height:'100%',width:`${val/maxKw*100}%`,background:'#FFB800',borderRadius:4}}/></div></div>))}</div></div><div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:20}}><div style={{background:cardBg,border:`1px solid ${border}`,borderRadius:12,padding:20}}><div style={{fontSize:11,textTransform:'uppercase',letterSpacing:'0.15em',color:muted,marginBottom:16}}>Каналы по источнику</div>{analytics.sources.length===0&&<div style={{color:muted,fontSize:12,textAlign:'center',padding:'20px 0'}}>Нет данных</div>}{analytics.sources.map(([src,val])=>(<div key={src} style={{marginBottom:10}}><div style={{display:'flex',justifyContent:'space-between',fontSize:11,marginBottom:4}}><span>{srcLabel[src]||src}</span><span style={{color:muted}}>{val}</span></div><div style={{height:6,borderRadius:4,background:dark?'#2a2a2a':'#f0f0f0',overflow:'hidden'}}><div style={{height:'100%',width:`${val/maxSrc*100}%`,background:dark?'#fff':'#000',borderRadius:4}}/></div></div>))}</div><div style={{background:cardBg,border:`1px solid ${border}`,borderRadius:12,padding:20}}><div style={{fontSize:11,textTransform:'uppercase',letterSpacing:'0.15em',color:muted,marginBottom:16}}>Топ каналов по охвату</div>{analytics.topByParticipants.length===0&&<div style={{color:muted,fontSize:12,textAlign:'center',padding:'20px 0'}}>Нет данных</div>}{analytics.topByParticipants.map((d,i)=>(<div key={d.id} onClick={()=>setSelected(d)} style={{display:'flex',alignItems:'center',gap:10,padding:'8px 0',borderBottom:i<analytics.topByParticipants.length-1?`1px solid ${border}`:'none',cursor:'pointer'}}><div style={{fontSize:11,color:muted,width:16,textAlign:'right'}}>{i+1}</div><Dot verdict={d.verdict}/><div style={{flex:1,minWidth:0,fontSize:12,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{d.title}</div><div style={{fontSize:11,color:muted,flexShrink:0}}>{d.participants>0?d.participants.toLocaleString():'—'}</div></div>))}</div></div><div style={{background:cardBg,border:`1px solid ${border}`,borderRadius:12,padding:20,marginTop:20}}><div style={{fontSize:11,textTransform:'uppercase',letterSpacing:'0.15em',color:muted,marginBottom:16}}>Топ опасных каналов</div>{dossiers.filter(d=>d.verdict==='dangerous').sort((a,b)=>b.riskPct-a.riskPct).slice(0,8).map((d,i)=>(<div key={d.id} onClick={()=>setSelected(d)} style={{display:'flex',alignItems:'center',gap:12,padding:'10px 0',borderBottom:`1px solid ${border}`,cursor:'pointer'}}><div style={{fontSize:12,color:muted,width:20,textAlign:'right'}}>{i+1}</div><div style={{width:32,height:32,borderRadius:8,background:'#FF2D2D',display:'flex',alignItems:'center',justifyContent:'center',color:'#fff',fontWeight:700,fontSize:13,flexShrink:0}}>{(d.title[0]||'?').toUpperCase()}</div><div style={{flex:1,minWidth:0}}><div style={{fontSize:12,fontWeight:700,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{d.title}</div><div style={{fontSize:11,color:muted,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>@{d.username} · {d.source_type}</div></div><div style={{flexShrink:0}}><RiskBadge score={d.riskPct}/></div><span style={{fontSize:11,color:'#FF2D2D',flexShrink:0}}>→</span></div>))}{dossiers.filter(d=>d.verdict==='dangerous').length===0&&<div style={{color:muted,fontSize:12,textAlign:'center',padding:'20px 0'}}>Опасных каналов не обнаружено</div>}</div></div>);})()}
+        {tab==='live'&&(<div style={{padding:24}}><div style={{display:'flex',alignItems:'center',gap:12,marginBottom:20,flexWrap:'wrap'}}><span style={{width:10,height:10,borderRadius:'50%',background:'#FF2D2D',animation:'pulseLive 1s infinite',display:'inline-block'}}/><h1 style={{fontSize:18,fontWeight:700,textTransform:'uppercase',letterSpacing:'0.1em'}}>LIVE Лента алертов</h1><span style={{fontSize:12,color:muted,border:`1px solid ${border}`,borderRadius:6,padding:'2px 8px'}}>{liveItems.length}</span><button onClick={()=>setLiveItems([])} style={{marginLeft:'auto',padding:'6px 14px',border:`1px solid ${border}`,borderRadius:8,background:'transparent',color:dark?'#fff':'#000',cursor:'pointer',fontSize:11,fontFamily:'inherit'}}>Очистить</button></div><div style={{maxWidth:900,display:'flex',flexDirection:'column',gap:8}}>{liveItems.length===0&&(<div style={{background:cardBg,border:`1px solid ${border}`,borderRadius:12,padding:40,textAlign:'center',color:muted,fontSize:12}}>Алертов нет. Данные обновляются каждые 15 секунд из /alerts</div>)}{liveItems.map(item=>(<div key={item.id} style={{background:cardBg,border:`1px solid ${border}`,borderRadius:12,padding:14,display:'flex',gap:12,animation:'slideIn .3s both'}}><div style={{display:'flex',flexDirection:'column',alignItems:'center',gap:4,flexShrink:0}}><span style={{width:7,height:7,borderRadius:'50%',background:'#FF2D2D',animation:'pulseLive 1s infinite',display:'inline-block'}}/><span style={{fontSize:9,color:muted}}>{item.time}</span></div><div style={{flex:1,minWidth:0}}><div style={{display:'flex',alignItems:'center',gap:8,marginBottom:4,flexWrap:'wrap'}}><span style={{fontSize:12,fontWeight:700}}>@{item.username}</span><RiskBadge score={item.risk}/>{item.risk>90&&<span style={{fontSize:10,color:'#FF2D2D'}}>⚠️ ВЫСОКИЙ РИСК</span>}</div><div style={{fontSize:12,color:dark?'#ccc':'#333',lineHeight:1.4}}>{item.title}</div></div></div>))}</div><div style={{marginTop:20,background:cardBg,border:`1px solid ${border}`,borderRadius:12,padding:16,maxWidth:900}}><div style={{fontSize:11,fontWeight:700,marginBottom:8,textTransform:'uppercase',letterSpacing:'0.1em'}}>API источник</div><div style={{fontSize:11,color:muted,lineHeight:1.8}}><div>GET {API}/alerts?unread_only=false&limit=50</div><div>Автообновление каждые 15 секунд</div></div></div></div>)}
+      </main>
+      {selected&&<DossierModal d={selected} dark={dark} border={border} onClose={()=>setSelected(null)}/>}
+    
+        </div>
+  );
+}
+ 
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
