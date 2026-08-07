@@ -1042,34 +1042,36 @@ async def save_ingest(ev: IngestRequest) -> dict:
                         safe_json(evd.metadata),
                     )
 
-         if ev.category != "CLEAN" and ev.risk_score >= ALERT_MIN_RISK:
-        evidence_objects = [
-            {"storage_url": e.storage_url, "mime_type": e.mime_type, "evidence_type": e.evidence_type}
-            for e in ev.evidence if e.storage_url
-        ]
-        await send_telegram_alert(
-            title=ev.title or ev.text or ev.source_name,
-            category=ev.category,
-            risk_score=ev.risk_score,
-            source_name=ev.source_name,
-            source_type=ev.source_type,
-            post_url=ev.item_url,
-            evidence_objects=evidence_objects,
-        )
+             # ==================== ВСТАВИТЬ ЭТОТ БЛОК ====================
+        if ev.category != "CLEAN" and ev.risk_score >= ALERT_MIN_RISK:
+            evidence_objects = [
+                {"storage_url": e.storage_url, "mime_type": e.mime_type, "evidence_type": e.evidence_type}
+                for e in ev.evidence if e.storage_url
+            ]
+            await send_telegram_alert(
+                title=ev.title or ev.text or ev.source_name,
+                category=ev.category,
+                risk_score=ev.risk_score,
+                source_name=ev.source_name,
+                source_type=ev.source_type,
+                post_url=ev.item_url,
+                evidence_objects=evidence_objects,
+            )
 
-    return {
-        "status": "success",
-        "project": ev.project,
-        "source_id": source_id,
-        "post_id": post_id,
-        "category": ev.category,
-        "risk_score": ev.risk_score,
-        "entities_saved": len(ev.entities),
-        "relations_saved": len(ev.relations),
-        "evidence_saved": len(ev.evidence),
-        "tags_saved": len(ev.tags),
-        "risk_adjusted": risk_boost > 0,
-    }
+        return {
+            "status": "success",
+            "project": ev.project,
+            "source_id": source_id,
+            "post_id": post_id,
+            "category": ev.category,
+            "risk_score": ev.risk_score,
+            "entities_saved": len(ev.entities),
+            "relations_saved": len(ev.relations),
+            "evidence_saved": len(ev.evidence),
+            "tags_saved": len(ev.tags),
+            "risk_adjusted": risk_boost > 0,
+        }
+    # ==================== КОНЕЦ БЛОКА ====================
     except HTTPException:
         raise
     except Exception as e:
@@ -1083,7 +1085,6 @@ async def save_ingest(ev: IngestRequest) -> dict:
         except Exception:
             pass
         raise HTTPException(500, detail=f"Ошибка сохранения данных: {str(e)[:500]}")
-
 # ============================================================
 # ЭНДПОИНТЫ
 # ============================================================
