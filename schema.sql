@@ -307,3 +307,7 @@ INSERT INTO categories (code, category_group, name_ru, name_kk, name_en, default
 ('ROMANCE_SCAM', 'SCAM', 'Романтический скам', 'Романтикалық алаяқтық', 'Romance scam', 'HIGH'),
 ('GENERAL_SCAM', 'SCAM', 'Общий скам', 'Жалпы алаяқтық', 'General scam', 'MEDIUM')
 ON CONFLICT (code) DO NOTHING;
+
+INSERT INTO categories (code, category_group, name_ru, name_kk, name_en, default_severity)
+VALUES ('VAPE_SCAM', 'ILLEGAL', 'Нелегальная продажа вейпов', 'Вейптерді заңсыз сату', 'Illegal vape sales', 'HIGH')
+ON CONFLICT (code) DO NOTHING;
