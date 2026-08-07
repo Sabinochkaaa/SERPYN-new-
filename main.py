@@ -1077,6 +1077,8 @@ async def save_ingest(ev: IngestRequest) -> dict:
                 source_type=ev.source_type,
                 post_url=ev.item_url,
                 evidence_objects=evidence_objects,
+               source_id=source_id  
+
             )
 
         return {
