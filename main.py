@@ -33,7 +33,7 @@ INGEST_TOKEN = os.getenv("INGEST_TOKEN", "").strip()
 DATA_ENCRYPTION_KEY = os.getenv("DATA_ENCRYPTION_KEY", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-DASHBOARD_URL = os.getenv("DASHBOARD_URL", "https://serpyn-serpyn.up.railway.app/").strip()
+DASHBOARD_URL = os.getenv("DASHBOARD_URL", "http://localhost:5500/calude_dash.html").strip()
 CORS_ORIGINS = [x.strip() for x in os.getenv("CORS_ORIGINS", "*").split(",") if x.strip()]
 MAX_POOL_SIZE = int(os.getenv("DB_POOL_MAX_SIZE", "10"))
 
