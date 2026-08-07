@@ -503,7 +503,7 @@ async def send_telegram_alert(
     source_name: str,
     source_type: str = "",
     post_url: Optional[str] = None,
-    evidence_urls: Optional[List[str]] = None,
+    evidence_objects: Optional[List[Dict]] = None,  # <--- ДОБАВЛЕН НОВЫЙ АРГУМЕНТ
 ) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -527,31 +527,55 @@ async def send_telegram_alert(
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
-            # Если есть скриншоты — отправляем ПЕРВОЕ фото с полным текстом в caption
-            if evidence_urls:
-                first_url = evidence_urls[0]
-                await client.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-                    json={
-                        "chat_id": TELEGRAM_CHAT_ID,
-                        "photo": first_url,
-                        "caption": message,
-                        "parse_mode": "Markdown",
-                        "reply_markup": reply_markup,
-                    },
-                )
-                # Остальные фото (если есть) отправляем без подписи или с краткой
-                for url in evidence_urls[1:10]:
+            if evidence_objects:
+                media_group = []
+                for idx, obj in enumerate(evidence_objects[:10]):
+                    url = obj.get("storage_url")
+                    if not url or not isinstance(url, str):
+                        continue
+                    
+                    ev_type = (obj.get("evidence_type") or "SCREENSHOT").upper()
+                    mime_type = (obj.get("mime_type") or "").lower()
+                    
+                    # Определяем, видео это или фото
+                    is_video = ev_type == "VIDEO" or mime_type.startswith("video/") or url.lower().endswith((".mp4", ".mov", ".avi", ".webm"))
+                    media_type = "video" if is_video else "photo"
+
+                    media_item = {"type": media_type, "media": url}
+                    # Описание (caption) добавляем ТОЛЬКО к первому элементу группы
+                    if idx == 0:
+                        media_item["caption"] = message
+                        media_item["parse_mode"] = "Markdown"
+                    
+                    media_group.append(media_item)
+
+                if len(media_group) > 1:
+                    # Отправляем группу из нескольких фото/видео с общим описанием
                     await client.post(
-                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMediaGroup",
                         json={
                             "chat_id": TELEGRAM_CHAT_ID,
-                            "photo": url,
-                            "caption": "📸 Дополнительный скриншот",
-                        },
+                            "media": media_group,
+                            "reply_markup": reply_markup,
+                        }
+                    )
+                elif len(media_group) == 1:
+                    # Если файл один
+                    item = media_group[0]
+                    endpoint = "sendVideo" if item["type"] == "video" else "sendPhoto"
+                    
+                    await client.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{endpoint}",
+                        json={
+                            "chat_id": TELEGRAM_CHAT_ID,
+                            item["type"]: item["media"],
+                            "caption": message,
+                            "parse_mode": "Markdown",
+                            "reply_markup": reply_markup,
+                        }
                     )
             else:
-                # Если скриншотов нет — отправляем только текст
+                # Если нет медиа, отправляем только текст
                 payload = {
                     "chat_id": TELEGRAM_CHAT_ID,
                     "text": message,
@@ -565,7 +589,7 @@ async def send_telegram_alert(
             logger.info("Telegram-уведомление отправлено")
         except Exception:
             logger.exception("Ошибка отправки Telegram-уведомления")
-
+            
 # ============================================================
 # PYDANTIC МОДЕЛИ
 # ============================================================
@@ -1018,18 +1042,21 @@ async def save_ingest(ev: IngestRequest) -> dict:
                         safe_json(evd.metadata),
                     )
 
-                if ev.category != "CLEAN":
-                    severity = severity_for(ev.risk_score)
-                    await conn.execute(
-                        """
-                        INSERT INTO alerts(project_id, source_id, post_id, alert_type, severity, title, message, risk_score)
-                        VALUES($1,$2,$3,'NEW_DETECTION',$4,$5,$6,$7)
-                        """,
-                        project_id, source_id, post_id, severity,
-                        f"{ev.category}: {ev.title or ev.source_name}",
-                        ev.explanation or ev.title or ev.text or ev.source_name,
-                        ev.risk_score,
-                    )
+                     if ev.category != "CLEAN" and ev.risk_score >= ALERT_MIN_RISK:
+            # Собираем полные объекты доказательств для Telegram
+            evidence_objects = [
+                {"storage_url": e.storage_url, "mime_type": e.mime_type, "evidence_type": e.evidence_type} 
+                for e in ev.evidence if e.storage_url
+            ]
+            await send_telegram_alert(
+                title=ev.title or ev.text or ev.source_name,
+                category=ev.category,
+                risk_score=ev.risk_score,
+                source_name=ev.source_name,
+                source_type=ev.source_type,
+                post_url=ev.item_url,
+                evidence_objects=evidence_objects,
+            )
 
                 await conn.execute(
                     "INSERT INTO ingest_events(request_id, source_type, payload_hash, status) VALUES($1,$2,$3,'SUCCESS')",
