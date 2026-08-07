@@ -508,7 +508,8 @@ async def send_telegram_alert(
     source_name: str,
     source_type: str = "",
     post_url: Optional[str] = None,
-    evidence_objects: Optional[List[Dict]] = None,  # <--- ДОБАВЛЕН НОВЫЙ АРГУМЕНТ
+    evidence_objects: Optional[List[Dict]] = None,
+    source_id: Optional[int] = None, 
 ) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -523,12 +524,32 @@ async def send_telegram_alert(
         f"📊 *Риск:* {risk_score:.2f} ({severity_for(risk_score)})\n"
         f"📝 *Тема:* {(title or '')[:200]}\n"
     )
-    if post_url:
-        message += f"\n🔗 [Открыть пост]({post_url})"
 
-    reply_markup = None
+    # ============= 1. ГЕНЕРИРУЕМ ССЫЛКУ НА ДАШБОРД С ID =============
+    dashboard_url = None
     if DASHBOARD_URL:
-        reply_markup = {"inline_keyboard": [[{"text": "📊 Открыть дашборд", "url": DASHBOARD_URL}]]}
+        dashboard_url = DASHBOARD_URL
+        if source_id:
+            if "?" in dashboard_url:
+                dashboard_url += f"&source_id={source_id}"
+            else:
+                dashboard_url += f"?source_id={source_id}"
+
+    # ============= 2. СОЗДАЕМ КНОПКИ (Вместо текстовых ссылок) =============
+    reply_markup = {"inline_keyboard": []}
+    
+    # 👇 ГЛАВНАЯ КНОПКА: Переход в досье внутри дашборда (заменяет битую ссылку)
+    if dashboard_url:
+        reply_markup["inline_keyboard"].append([{"text": "📂 Открыть досье", "url": dashboard_url}])
+
+    # 👇 Дополнительная кнопка: Если оригинальная ссылка все-таки нужна
+    if post_url:
+        if not post_url.startswith('http://') and not post_url.startswith('https://'):
+            post_url = 'https://' + post_url
+        reply_markup["inline_keyboard"].append([{"text": "🔗 Исходный пост (внешний)", "url": post_url}])
+
+    if not reply_markup["inline_keyboard"]:
+        reply_markup = None
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
@@ -542,12 +563,10 @@ async def send_telegram_alert(
                     ev_type = (obj.get("evidence_type") or "SCREENSHOT").upper()
                     mime_type = (obj.get("mime_type") or "").lower()
                     
-                    # Определяем, видео это или фото
                     is_video = ev_type == "VIDEO" or mime_type.startswith("video/") or url.lower().endswith((".mp4", ".mov", ".avi", ".webm"))
                     media_type = "video" if is_video else "photo"
 
                     media_item = {"type": media_type, "media": url}
-                    # Описание (caption) добавляем ТОЛЬКО к первому элементу группы
                     if idx == 0:
                         media_item["caption"] = message
                         media_item["parse_mode"] = "Markdown"
@@ -555,7 +574,6 @@ async def send_telegram_alert(
                     media_group.append(media_item)
 
                 if len(media_group) > 1:
-                    # Отправляем группу из нескольких фото/видео с общим описанием
                     await client.post(
                         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMediaGroup",
                         json={
@@ -565,7 +583,6 @@ async def send_telegram_alert(
                         }
                     )
                 elif len(media_group) == 1:
-                    # Если файл один
                     item = media_group[0]
                     endpoint = "sendVideo" if item["type"] == "video" else "sendPhoto"
                     
@@ -580,22 +597,21 @@ async def send_telegram_alert(
                         }
                     )
             else:
-                # Если нет медиа, отправляем только текст
-                payload = {
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message,
-                    "parse_mode": "Markdown",
-                    "disable_web_page_preview": True,
-                }
-                if reply_markup:
-                    payload["reply_markup"] = reply_markup
-                await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json=payload)
+                await client.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    json={
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "text": message,
+                        "parse_mode": "Markdown",
+                        "disable_web_page_preview": True,
+                        "reply_markup": reply_markup,
+                    }
+                )
 
             logger.info("Telegram-уведомление отправлено")
         except Exception:
             logger.exception("Ошибка отправки Telegram-уведомления")
             
-# ============================================================
 # PYDANTIC МОДЕЛИ
 # ============================================================
 class StrictModel(BaseModel):
