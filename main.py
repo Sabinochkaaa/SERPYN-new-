@@ -219,7 +219,11 @@ CATEGORY_ALIASES: Dict[str, str] = {
     "general_scam": "GENERAL_SCAM",
     "other": "OTHER",
     "pension_scam": "PYRAMID",
-    
+        # Азартные игры / Казино (расширенный список)
+    "азартные игры": "GAMBLING", "казино": "GAMBLING", "онлайн казино": "GAMBLING", 
+    "слоты": "GAMBLING", "рулетка": "GAMBLING", "покер": "GAMBLING", 
+    "құмар ойын": "GAMBLING", "gambling": "GAMBLING", "casino": "GAMBLING",
+    "бездепозитный бонус": "GAMBLING", "бонус за регистрацию": "GAMBLING",
 }
 
 def normalize_category(value: Optional[str]) -> str:
@@ -1588,30 +1592,62 @@ async def wallet_dossier(address: str, request: Request, reveal: bool = False) -
         return await fetch_entity_dossier(conn, entity_id, reveal)
 
 @app.get("/graph")
-async def graph(min_risk: float = Query(0.0, ge=0, le=1), limit: int = Query(2000, ge=1, le=10000)) -> dict:
+async def graph(
+    source_id: Optional[int] = Query(None, description="ID источника для фильтрации локального графа"),
+    min_risk: float = Query(0.0, ge=0, le=1), 
+    limit: int = Query(2000, ge=1, le=10000)
+) -> dict:
     assert pool is not None
     async with pool.acquire() as conn:
-        edges = await conn.fetch(
-            """
-            SELECT r.id, r.source_entity_id AS source, r.target_entity_id AS target,
-                   r.relation_type AS label, r.confidence, r.risk_score, r.description, r.evidence_post_id
-            FROM relations r WHERE r.risk_score >= $1
-            ORDER BY r.risk_score DESC, r.last_seen DESC LIMIT $2
-            """,
-            min_risk, limit,
-        )
-        node_ids = {row["source"] for row in edges} | {row["target"] for row in edges}
-        nodes = []
-        if node_ids:
+        if source_id:
+            # Локальный граф: выбираем сущности, привязанные к постам этого источника
             node_rows = await conn.fetch(
                 """
-                SELECT id, entity_type AS type, display_value AS label, risk_score, category, city, metadata
-                FROM entities WHERE id = ANY($1::bigint[])
-                """,
-                list(node_ids),
+                SELECT DISTINCT e.id, e.entity_type AS type, e.display_value AS label,
+                       e.risk_score, e.category, e.city, e.metadata
+                FROM entities e
+                JOIN post_entities pe ON pe.entity_id = e.id
+                JOIN posts p ON p.id = pe.post_id
+                WHERE p.source_id = $1
+                """, source_id
             )
-            nodes = [dict(x) for x in node_rows]
-        return {"nodes": nodes, "edges": [dict(x) for x in edges]}
+            node_ids = [row["id"] for row in node_rows]
+            
+            edges = []
+            if node_ids:
+                edges = await conn.fetch(
+                    """
+                    SELECT r.source_entity_id AS source, r.target_entity_id AS target,
+                           r.relation_type AS label, r.confidence, r.risk_score,
+                           r.description, r.evidence_post_id
+                    FROM relations r
+                    WHERE r.source_entity_id = ANY($1::bigint[]) 
+                       OR r.target_entity_id = ANY($1::bigint[])
+                    """, node_ids
+                )
+        else:
+            # Глобальный граф (ваша текущая логика)
+            edges = await conn.fetch(
+                """
+                SELECT r.source_entity_id AS source, r.target_entity_id AS target,
+                       r.relation_type AS label, r.confidence, r.risk_score,
+                       r.description, r.evidence_post_id
+                FROM relations r WHERE r.risk_score >= $1
+                ORDER BY r.risk_score DESC, r.last_seen DESC LIMIT $2
+                """, min_risk, limit,
+            )
+            node_ids = {row["source"] for row in edges} | {row["target"] for row in edges}
+            if node_ids:
+                node_rows = await conn.fetch(
+                    """
+                    SELECT id, entity_type AS type, display_value AS label, 
+                           risk_score, category, city, metadata
+                    FROM entities WHERE id = ANY($1::bigint[])
+                    """, list(node_ids),
+                )
+                
+        return {"nodes": [dict(x) for x in node_rows], "edges": [dict(x) for x in edges]}
+        
 
 @app.get("/stats")
 async def stats() -> dict:
