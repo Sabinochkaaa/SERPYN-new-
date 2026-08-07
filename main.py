@@ -20,18 +20,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 load_dotenv()
 
-# ============================================================
 # НАСТРОЙКА ЛОГИРОВАНИЯ
-# ============================================================
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("serpyn")
 
-# ============================================================
 # ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
-# ============================================================
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 INGEST_TOKEN = os.getenv("INGEST_TOKEN", "").strip()
 DATA_ENCRYPTION_KEY = os.getenv("DATA_ENCRYPTION_KEY", "").strip()
@@ -53,9 +49,8 @@ if not DATABASE_URL:
 if not INGEST_TOKEN:
     logger.warning("INGEST_TOKEN не задан – эндпоинты не защищены!")
 
-# ============================================================
 # ШИФРОВАНИЕ
-# ============================================================
+
 fernet: Optional[Fernet] = None
 if DATA_ENCRYPTION_KEY:
     try:
@@ -65,9 +60,7 @@ if DATA_ENCRYPTION_KEY:
 else:
     logger.warning("DATA_ENCRYPTION_KEY не задан – чувствительные данные не шифруются.")
 
-# ============================================================
 # SUPABASE STORAGE КЛИЕНТ
-# ============================================================
 supabase_client = None
 if SUPABASE_URL and SUPABASE_SERVICE_KEY:
     try:
