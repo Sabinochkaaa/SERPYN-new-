@@ -217,6 +217,42 @@ CATEGORY_ALIASES: Dict[str, str] = {
     "слоты": "GAMBLING", "рулетка": "GAMBLING", "покер": "GAMBLING", 
     "құмар ойын": "GAMBLING", "gambling": "GAMBLING", "casino": "GAMBLING",
     "бездепозитный бонус": "GAMBLING", "бонус за регистрацию": "GAMBLING",
+  
+    "вейп": "VAPE", "электронная сигарета": "VAPE", "электронка": "VAPE",
+    "vape": "VAPE", "e-cigarette": "VAPE", "ecig": "VAPE",
+    "одноразка": "DISPOSABLE_VAPE", "одноразовая сигарета": "DISPOSABLE_VAPE",
+    "disposable vape": "DISPOSABLE_VAPE", "disposable": "DISPOSABLE_VAPE",
+    "pod": "POD_SYSTEM", "поды": "POD_SYSTEM", "pod system": "POD_SYSTEM",
+    "снюс": "NICOTINE_POUCH", "nicotine pouch": "NICOTINE_POUCH",
+    "никotine": "NICOTINE", "никотин": "NICOTINE",
+    "жижа": "E_LIQUID", "жидкость для вейпа": "E_LIQUID", "e-liquid": "E_LIQUID",
+    "солевой никотин": "SALT_NICOTINE", "salt nicotine": "SALT_NICOTINE",
+    "продажа вейпов": "VAPE_SALE", "vape shop": "VAPE_SALE",
+    "вейп шоп": "VAPE_SALE", "магазин вейпов": "VAPE_SALE",
+    "нелегальный вейп": "ILLEGAL_VAPE", "поддельный вейп": "ILLEGAL_VAPE",
+    "контрафактный вейп": "ILLEGAL_VAPE", "fake vape": "ILLEGAL_VAPE",
+    "вейп без акциза": "TAX_EVASION_VAPE", "контрабанда вейпов": "SMUGGLED_VAPE",
+    "smuggled vape": "SMUGGLED_VAPE",
+    # Дополнительные вариации
+    "одноразовый вейп": "DISPOSABLE_VAPE",
+    "одноразовые электронные сигареты": "DISPOSABLE_VAPE",
+    "vape disposable": "DISPOSABLE_VAPE",
+    "электронная сигарета одноразовая": "DISPOSABLE_VAPE",
+    "пэд": "POD_SYSTEM", "под": "POD_SYSTEM",
+    "испаритель": "VAPE", "atomizer": "VAPE",
+    "койл": "VAPE_COIL", "coil": "VAPE_COIL",
+    "аккумулятор для вейпа": "VAPE_BATTERY",
+    "заправка для вейпа": "VAPE_REFILL",
+    
+    # Расширенные категории для мошенничества с вейпами
+    "фейк вейп": "VAPE_SCAM",
+    "подделка вейпа": "VAPE_SCAM", 
+    "вейп мошенничество": "VAPE_SCAM",
+    "vape scam": "VAPE_SCAM",
+    "некачественный вейп": "DANGEROUS_VAPE",
+    "опасный вейп": "DANGEROUS_VAPE",
+    "dangerous vape": "DANGEROUS_VAPE",
+    "токсичный вейп": "TOXIC_VAPE",
 }
 
 def normalize_category(value: Optional[str]) -> str:
