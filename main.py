@@ -576,32 +576,41 @@ async def send_telegram_alert(
         f"📝 *Тема:* {(title or '')[:200]}\n"
     )
 
-    # ============= 1. ГЕНЕРИРУЕМ ССЫЛКУ НА ДАШБОРД С ID =============
+    # ============================================================
+    # 1. ГЕНЕРАЦИЯ ССЫЛКИ НА КОНКРЕТНОЕ ДОСЬЕ
+    # ============================================================
     dashboard_url = None
     if DASHBOARD_URL:
         dashboard_url = DASHBOARD_URL
         if source_id:
+            # Добавляем ID в ссылку. Защита от двойных ? и &.
             if "?" in dashboard_url:
                 dashboard_url += f"&source_id={source_id}"
             else:
                 dashboard_url += f"?source_id={source_id}"
 
-    # ============= 2. СОЗДАЕМ КНОПКИ (Вместо текстовых ссылок) =============
+    # ============================================================
+    # 2. ФОРМИРОВАНИЕ КНОПОК (Inline Keyboard)
+    # ============================================================
     reply_markup = {"inline_keyboard": []}
     
-    # 👇 ГЛАВНАЯ КНОПКА: Переход в досье внутри дашборда (заменяет битую ссылку)
+    # Кнопка 1: Всегда открывает досье на дашборде
     if dashboard_url:
         reply_markup["inline_keyboard"].append([{"text": "📂 Открыть досье", "url": dashboard_url}])
 
-    # 👇 Дополнительная кнопка: Если оригинальная ссылка все-таки нужна
+    # Кнопка 2: Если есть ссылка на оригинальный пост
     if post_url:
         if not post_url.startswith('http://') and not post_url.startswith('https://'):
             post_url = 'https://' + post_url
         reply_markup["inline_keyboard"].append([{"text": "🔗 Исходный пост (внешний)", "url": post_url}])
 
+    # Если кнопок не получилось - отключаем клавиатуру
     if not reply_markup["inline_keyboard"]:
         reply_markup = None
 
+    # ============================================================
+    # 3. ОТПРАВКА В TELEGRAM (MediaGroup, Video, Photo, Text)
+    # ============================================================
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
             if evidence_objects:
@@ -624,6 +633,7 @@ async def send_telegram_alert(
                     
                     media_group.append(media_item)
 
+                # Группа из 2+ файлов
                 if len(media_group) > 1:
                     await client.post(
                         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMediaGroup",
@@ -633,10 +643,10 @@ async def send_telegram_alert(
                             "reply_markup": reply_markup,
                         }
                     )
+                # 1 файл (видео или фото)
                 elif len(media_group) == 1:
                     item = media_group[0]
                     endpoint = "sendVideo" if item["type"] == "video" else "sendPhoto"
-                    
                     await client.post(
                         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{endpoint}",
                         json={
@@ -648,6 +658,7 @@ async def send_telegram_alert(
                         }
                     )
             else:
+                # Только текст
                 await client.post(
                     f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                     json={
@@ -662,7 +673,6 @@ async def send_telegram_alert(
             logger.info("Telegram-уведомление отправлено")
         except Exception:
             logger.exception("Ошибка отправки Telegram-уведомления")
-            
 # PYDANTIC МОДЕЛИ
 # ============================================================
 class StrictModel(BaseModel):
