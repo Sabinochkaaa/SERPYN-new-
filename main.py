@@ -270,6 +270,30 @@ def normalize_evidence_type(value: Optional[str]) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", str(value).upper()).strip("_")
     return cleaned if cleaned in EVIDENCE_TYPES else "OTHER"
 
+IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "gif", "bmp", "heic", "heif"}
+VIDEO_EXTENSIONS = {"mp4", "mov", "webm", "avi", "mkv", "m4v", "3gp"}
+EXTENSION_MIME_MAP = {
+    "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+    "webp": "image/webp", "gif": "image/gif", "bmp": "image/bmp",
+    "heic": "image/heic", "heif": "image/heif",
+    "mp4": "video/mp4", "mov": "video/quicktime", "webm": "video/webm",
+    "avi": "video/x-msvideo", "mkv": "video/x-matroska", "m4v": "video/x-m4v",
+    "3gp": "video/3gpp",
+    "pdf": "application/pdf", "html": "text/html",
+}
+
+def guess_evidence_type_and_mime(url: str, default_type: str = "SCREENSHOT") -> tuple[str, Optional[str]]:
+    """Определяет тип улики (скриншот/видео/...) и mime_type по расширению файла в URL."""
+    if not url:
+        return default_type, None
+    clean = url.split("?", 1)[0].split("#", 1)[0]
+    ext = clean.rsplit(".", 1)[-1].lower() if "." in clean.rsplit("/", 1)[-1] else ""
+    if ext in VIDEO_EXTENSIONS:
+        return "VIDEO", EXTENSION_MIME_MAP.get(ext, "video/mp4")
+    if ext in IMAGE_EXTENSIONS:
+        return default_type, EXTENSION_MIME_MAP.get(ext, "image/png")
+    return default_type, EXTENSION_MIME_MAP.get(ext)
+
 def normalize_entity_value(entity_type: str, value: str) -> str:
     value = (value or "").strip()
     if entity_type in {"PHONE", "BANK_CARD", "IBAN"}:
@@ -345,6 +369,15 @@ def severity_for(risk: float) -> str:
     if risk >= 0.5:
         return "MEDIUM"
     return "LOW"
+
+def severity_category_from_risk(risk: float) -> str:
+    """Категория по умолчанию, если явной категории нет — согласована с тем же порогом риска,
+    что и severity_for/эскалация в save_ingest, чтобы категория никогда не расходилась с риском."""
+    if risk >= RISK_THRESHOLD_HIGH:
+        return "OTHER_SCAM"
+    if risk >= RISK_THRESHOLD_MEDIUM:
+        return "SUSPICIOUS"
+    return "CLEAN"
 
 RED_FLAG_PATTERNS = [
     r"гаранти(?:ру|ро)ванн(?:ый|ая|ое|ные)\s+(?:доход|прибыль|выплат)",
@@ -693,6 +726,8 @@ class YouTubeAdResult(BaseModel):
     search_keyword: str = ""
     screenshot_path: str = ""
     screenshot_url: Optional[str] = None
+    screenshot_urls: List[str] = []
+    evidence_urls: List[str] = []
     transparency_url: str = ""
     scraped_at: str = None
     risk_score: int = 0
@@ -1112,30 +1147,30 @@ async def ingest(ev: IngestRequest, request: Request) -> dict:
     require_ingest_token(request.headers.get("X-Ingest-Token"))
     return await save_ingest(ev)
 
-@app.post("/ingest/youtube")
-async def ingest_youtube(payload: YouTubeHunterPayload, request: Request) -> dict:
-    require_ingest_token(request.headers.get("X-Ingest-Token"))
-    saved, failed = 0, 0
-
-    def detect_source_type(url: str) -> str:
-        if not url:
-            return "OTHER"
-        u = url.lower()
-        if "youtube.com" in u or "youtu.be" in u:
-            return "YOUTUBE"
-        if "t.me" in u or "telegram" in u:
-            return "TELEGRAM"
-        if "instagram.com" in u:
-            return "INSTAGRAM"
-        if "tiktok.com" in u:
-            return "TIKTOK"
-        if "threads.net" in u:
-            return "THREADS"
-        if "facebook.com" in u or "fb.com" in u:
-            return "FACEBOOK"
-        if "vk.com" in u:
-            return "VK"
+def _detect_source_type_from_url(url: Optional[str]) -> str:
+    if not url:
         return "OTHER"
+    u = url.lower()
+    if "youtube.com" in u or "youtu.be" in u:
+        return "YOUTUBE"
+    if "t.me" in u or "telegram" in u:
+        return "TELEGRAM"
+    if "instagram.com" in u:
+        return "INSTAGRAM"
+    if "tiktok.com" in u:
+        return "TIKTOK"
+    if "threads.net" in u:
+        return "THREADS"
+    if "facebook.com" in u or "fb.com" in u:
+        return "FACEBOOK"
+    if "vk.com" in u:
+        return "VK"
+    return "OTHER"
+
+async def _ingest_youtube_hunter_legacy(payload: YouTubeHunterPayload) -> dict:
+    """Старый формат YouTube Hunter (пакет объявлений в payload.ads). Оставлен для обратной совместимости."""
+    saved, failed = 0, 0
+    verdict_map = {"dangerous": "OTHER_SCAM", "suspicious": "SUSPICIOUS", "safe": "CLEAN"}
 
     for ad in payload.ads:
         try:
@@ -1150,11 +1185,14 @@ async def ingest_youtube(payload: YouTubeHunterPayload, request: Request) -> dic
             if not video_id:
                 video_id = stable_item_id(ad.transparency_url, ad.ad_text, ad.advertiser_name)
 
-            verdict_map = {"dangerous": "OTHER_SCAM", "suspicious": "SUSPICIOUS", "safe": "CLEAN"}
-            category = verdict_map.get((ad.verdict or "").lower(), "UNKNOWN")
             risk_norm = min(max(ad.risk_score, 0) / 100.0, 1.0)
+            # Категория берётся из того же сигнала, что и риск (scheme_type от классификатора),
+            # а не отдельно от verdict — чтобы категория и уровень риска всегда были согласованы.
+            category = normalize_category(ad.scheme_type) if ad.scheme_type else "UNKNOWN"
+            if category == "UNKNOWN":
+                category = verdict_map.get((ad.verdict or "").lower(), severity_category_from_risk(risk_norm))
 
-            extra = ad.model_dump(exclude={"screenshot_path", "screenshot_url"})
+            extra = ad.model_dump(exclude={"screenshot_path", "screenshot_url", "screenshot_urls", "evidence_urls"})
             extra["arrfr_check"] = ad.arrfr_check.model_dump()
             extra["domain_risk"] = ad.domain_risk.model_dump()
 
@@ -1166,17 +1204,24 @@ async def ingest_youtube(payload: YouTubeHunterPayload, request: Request) -> dic
                     metadata={"source": "youtube_hunter"},
                 ))
 
+            # Поддержка нескольких вложений (скриншоты и/или видео), а не только одного скрина.
+            all_urls: List[str] = []
+            for u in [ad.screenshot_url, *ad.screenshot_urls, *ad.evidence_urls]:
+                if u and u not in all_urls:
+                    all_urls.append(u)
+
             evidence = []
-            if ad.screenshot_url:
+            for u in all_urls:
+                ev_type, mime = guess_evidence_type_and_mime(u, default_type="SCREENSHOT")
                 evidence.append(EvidenceInput(
-                    evidence_type="SCREENSHOT", storage_url=ad.screenshot_url,
+                    evidence_type=ev_type, storage_url=u, mime_type=mime,
                     original_url=ad.transparency_url, captured_at=ad.scraped_at,
                     captured_by="youtube_hunter", metadata={"verdict": ad.verdict},
                 ))
-            elif ad.screenshot_path:
+            if not all_urls and ad.screenshot_path:
                 logger.warning(f"Скриншот не загружен в облако: {ad.screenshot_path}")
 
-            real_source_type = detect_source_type(ad.transparency_url or ad.search_keyword)
+            real_source_type = _detect_source_type_from_url(ad.transparency_url or ad.search_keyword)
             source_external_id = ad.advertiser_domain or video_id
             if real_source_type == "TELEGRAM" and ad.transparency_url:
                 tg_match = re.search(r"t\.me/([a-zA-Z0-9_]+|\+[a-zA-Z0-9_]+)", ad.transparency_url)
@@ -1218,6 +1263,36 @@ async def ingest_youtube(payload: YouTubeHunterPayload, request: Request) -> dic
 
     return {"status": "success", "saved": saved, "failed": failed, "total": len(payload.ads)}
 
+@app.post("/ingest/youtube")
+async def ingest_youtube(request: Request) -> dict:
+    """
+    Приём данных с YouTube. Работает точно так же, как общий /ingest (тот же формат,
+    что используется для TikTok): один объект IngestRequest или список объектов —
+    category и risk_score берутся ровно такими, какими их прислал классификатор,
+    без переопределения, и evidence поддерживает сколько угодно скриншотов/видео.
+    Старый пакетный формат YouTube Hunter ({"ads": [...]}) по-прежнему поддерживается
+    для обратной совместимости.
+    """
+    require_ingest_token(request.headers.get("X-Ingest-Token"))
+    raw_body = await request.json()
+
+    if isinstance(raw_body, dict) and "ads" in raw_body:
+        payload = YouTubeHunterPayload.model_validate(raw_body)
+        return await _ingest_youtube_hunter_legacy(payload)
+
+    items = raw_body if isinstance(raw_body, list) else [raw_body]
+    saved, failed = 0, 0
+    for item in items:
+        try:
+            ev = IngestRequest.model_validate(item)
+            await save_ingest(ev)
+            saved += 1
+        except Exception as e:
+            failed += 1
+            logger.error(f"Ошибка сохранения youtube-записи: {e}")
+
+    return {"status": "success", "saved": saved, "failed": failed, "total": len(items)}
+
 @app.post("/upload_screenshot")
 async def upload_screenshot(req: UploadScreenshotRequest, request: Request) -> dict:
     require_ingest_token(request.headers.get("X-Ingest-Token"))
@@ -1234,11 +1309,7 @@ async def upload_screenshot(req: UploadScreenshotRequest, request: Request) -> d
     if not re.match(r"^[a-z0-9]{1,10}$", ext):
         ext = "png"
     unique_name = f"{uuid.uuid4()}.{ext}"
-    content_type = {
-        "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
-        "webp": "image/webp", "pdf": "application/pdf", "html": "text/html",
-        "mp4": "video/mp4",
-    }.get(ext, "application/octet-stream")
+    content_type = EXTENSION_MIME_MAP.get(ext, "application/octet-stream")
 
     try:
         folder = re.sub(r"[^a-zA-Z0-9_-]", "", req.folder) or "evidence"
