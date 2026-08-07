@@ -217,6 +217,11 @@ CATEGORY_ALIASES: Dict[str, str] = {
     "слоты": "GAMBLING", "рулетка": "GAMBLING", "покер": "GAMBLING", 
     "құмар ойын": "GAMBLING", "gambling": "GAMBLING", "casino": "GAMBLING",
     "бездепозитный бонус": "GAMBLING", "бонус за регистрацию": "GAMBLING",
+        # Вейпы / Электронные сигареты
+    "вейп": "VAPE_SCAM", "vape": "VAPE_SCAM", "жижа": "VAPE_SCAM",
+    "электронные сигареты": "VAPE_SCAM", "подак": "VAPE_SCAM", "pod system": "VAPE_SCAM",
+    "електронды темекі": "VAPE_SCAM", "вэйп": "VAPE_SCAM",
+    "заправка для вейпа": "VAPE_SCAM", "жидкость для вейпа": "VAPE_SCAM",
 }
 
 def normalize_category(value: Optional[str]) -> str:
