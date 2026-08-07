@@ -1042,52 +1042,34 @@ async def save_ingest(ev: IngestRequest) -> dict:
                         safe_json(evd.metadata),
                     )
 
-                     if ev.category != "CLEAN" and ev.risk_score >= ALERT_MIN_RISK:
-            # Собираем полные объекты доказательств для Telegram
-            evidence_objects = [
-                {"storage_url": e.storage_url, "mime_type": e.mime_type, "evidence_type": e.evidence_type} 
-                for e in ev.evidence if e.storage_url
-            ]
-            await send_telegram_alert(
-                title=ev.title or ev.text or ev.source_name,
-                category=ev.category,
-                risk_score=ev.risk_score,
-                source_name=ev.source_name,
-                source_type=ev.source_type,
-                post_url=ev.item_url,
-                evidence_objects=evidence_objects,
-            )
+         if ev.category != "CLEAN" and ev.risk_score >= ALERT_MIN_RISK:
+        evidence_objects = [
+            {"storage_url": e.storage_url, "mime_type": e.mime_type, "evidence_type": e.evidence_type}
+            for e in ev.evidence if e.storage_url
+        ]
+        await send_telegram_alert(
+            title=ev.title or ev.text or ev.source_name,
+            category=ev.category,
+            risk_score=ev.risk_score,
+            source_name=ev.source_name,
+            source_type=ev.source_type,
+            post_url=ev.item_url,
+            evidence_objects=evidence_objects,
+        )
 
-                await conn.execute(
-                    "INSERT INTO ingest_events(request_id, source_type, payload_hash, status) VALUES($1,$2,$3,'SUCCESS')",
-                    ev.request_id, ev.source_type, payload_hash,
-                )
-
-        if ev.category != "CLEAN" and ev.risk_score >= ALERT_MIN_RISK:
-            evidence_urls = [e.storage_url for e in ev.evidence if e.storage_url]
-            await send_telegram_alert(
-                title=ev.title or ev.text or ev.source_name,
-                category=ev.category,
-                risk_score=ev.risk_score,
-                source_name=ev.source_name,
-                source_type=ev.source_type,
-                post_url=ev.item_url,
-                evidence_urls=evidence_urls,
-            )
-
-        return {
-            "status": "success",
-            "project": ev.project,
-            "source_id": source_id,
-            "post_id": post_id,
-            "category": ev.category,
-            "risk_score": ev.risk_score,
-            "entities_saved": len(ev.entities),
-            "relations_saved": len(ev.relations),
-            "evidence_saved": len(ev.evidence),
-            "tags_saved": len(ev.tags),
-            "risk_adjusted": risk_boost > 0,
-        }
+    return {
+        "status": "success",
+        "project": ev.project,
+        "source_id": source_id,
+        "post_id": post_id,
+        "category": ev.category,
+        "risk_score": ev.risk_score,
+        "entities_saved": len(ev.entities),
+        "relations_saved": len(ev.relations),
+        "evidence_saved": len(ev.evidence),
+        "tags_saved": len(ev.tags),
+        "risk_adjusted": risk_boost > 0,
+    }
     except HTTPException:
         raise
     except Exception as e:
