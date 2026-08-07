@@ -222,6 +222,57 @@ CATEGORY_ALIASES: Dict[str, str] = {
     "электронные сигареты": "VAPE_SCAM", "подак": "VAPE_SCAM", "pod system": "VAPE_SCAM",
     "електронды темекі": "VAPE_SCAM", "вэйп": "VAPE_SCAM",
     "заправка для вейпа": "VAPE_SCAM", "жидкость для вейпа": "VAPE_SCAM",
+
+    # Эскорт и нелегальные услуги
+    "эскорт": "ESCORT", "escort": "ESCORT", "эскорт услуги": "ESCORT",
+    "сопровождение": "ESCORT", "девушки по вызову": "ESCORT",
+    "call girl": "ESCORT", "call-girl": "ESCORT", "callgirl": "ESCORT",
+    "элитный эскорт": "ESCORT", "vip эскорт": "ESCORT",
+    "массаж с окончанием": "ESCORT", "эромассаж": "ESCORT",
+    "интим услуги": "ESCORT", "интимные услуги": "ESCORT",
+    "секс услуги": "ESCORT", "сексуальные услуги": "ESCORT",
+    "проституция": "PROSTITUTION", "проститутки": "PROSTITUTION",
+    "шлюхи": "PROSTITUTION", "путаны": "PROSTITUTION",
+    "prostitution": "PROSTITUTION", "prostitute": "PROSTITUTION",
+    "индивидуалка": "ESCORT", "индивидуалки": "ESCORT",
+    "девушка на час": "ESCORT", "девушка по вызову": "ESCORT",
+    "ночь с девушкой": "ESCORT", "девушка в подарок": "ESCORT",
+    "снять девушку": "ESCORT", "снять проститутку": "PROSTITUTION",
+    
+    # Нелегальные услуги (расширение)
+    "нелегальные услуги": "ILLEGAL_SERVICES", "заңсыз қызмет": "ILLEGAL_SERVICES",
+    "illegal services": "ILLEGAL_SERVICES", "незаконные услуги": "ILLEGAL_SERVICES",
+    "теневые услуги": "ILLEGAL_SERVICES", "теневая экономика": "ILLEGAL_SERVICES",
+    "подпольный бизнес": "ILLEGAL_SERVICES", "нелегальный бизнес": "ILLEGAL_SERVICES",
+    
+    # Сутенерство
+    "сутенер": "PIMPING", "сутенерство": "PIMPING",
+    "pimp": "PIMPING", "pimping": "PIMPING",
+    "организация досуга": "PIMPING", "досуг с девушками": "PIMPING",
+    
+    # Нелегальные массажные салоны
+    "массажный салон": "ILLEGAL_SPA", "спа салон": "ILLEGAL_SPA",
+    "массаж": "ILLEGAL_SPA", "иллегальный массаж": "ILLEGAL_SPA",
+    
+    # Сайты знакомств для взрослых
+    "сайт знакомств": "ADULT_DATING", "знакомства": "ADULT_DATING",
+    "взрослые знакомства": "ADULT_DATING", "adult dating": "ADULT_DATING",
+    "dating site": "ADULT_DATING", "dating app": "ADULT_DATING",
+    
+    # Другие нелегальные услуги
+    "фальшивые паспорта": "FORGERY", "липовые документы": "FORGERY",
+    "купить права": "FAKE_LICENSE", "права без обучения": "FAKE_LICENSE",
+    "медицинская справка": "FAKE_LICENSE", "справка без осмотра": "FAKE_LICENSE",
+    "регистрация без проживания": "ILLEGAL_SERVICES",
+    "фиктивная регистрация": "ILLEGAL_SERVICES",
+    
+    # Прямые соответствия для парсера
+    "escort": "ESCORT",
+    "prostitution": "PROSTITUTION", 
+    "pimping": "PIMPING",
+    "illegal_services": "ILLEGAL_SERVICES",
+    "adult_dating": "ADULT_DATING",
+    "illegal_spa": "ILLEGAL_SPA",
 }
 
 def normalize_category(value: Optional[str]) -> str:
