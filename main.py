@@ -175,58 +175,6 @@ CATEGORY_ALIASES: Dict[str, str] = {
     "fake_state": "FAKE_STATE",
     "фейк займ": "FAKE_LOAN", "fake loan": "FAKE_LOAN", "fake_loan": "FAKE_LOAN",
 
-    # --- Наркотики / «кладмены» ---
-    "наркотик": "DRUGS", "наркота": "DRUGS", "есірткі": "DRUGS", "drugs": "DRUGS", "drug sale": "DRUGS",
-    "кладмен": "DRUG_DEALER", "закладчик": "DRUG_DEALER", "закладка": "DRUG_DEALER",
-    "kladmen": "DRUG_DEALER", "dead drop": "DRUG_DEALER",
-    "работа закладчиком": "DRUG_RECRUITMENT", "требуется курьер": "DRUG_RECRUITMENT",
-    "лёгкий заработок курьером": "DRUG_RECRUITMENT",
-
-    # --- Оружие / документы / контрафакт ---
-    "оружие": "WEAPONS", "қару-жарақ": "WEAPONS", "weapon": "WEAPONS", "weapons": "WEAPONS",
-    "подделка документов": "FORGERY", "құжат жасау": "FORGERY", "document forgery": "FORGERY",
-    "фальшивые документы": "FORGERY", "жалған құжат": "FORGERY", "фальшивые паспорта": "FORGERY",
-    "fake_docs": "FAKE_DOCS",
-    "права без экзамена": "FAKE_LICENSE", "купить диплом": "FAKE_LICENSE", "купить права": "FAKE_LICENSE",
-    "fake license": "FAKE_LICENSE", "fake diploma": "FAKE_LICENSE", "справка без осмотра": "FAKE_LICENSE",
-    "контрафакт": "COUNTERFEIT", "контрафактілі өнім": "COUNTERFEIT", "counterfeit": "COUNTERFEIT",
-
-    # --- Прочий скам ---
-    "фишинг": "PHISHING", "phishing": "PHISHING",
-    "фейк магазин": "FAKE_SHOP", "поддельный магазин": "FAKE_SHOP", "жалған дүкен": "FAKE_SHOP",
-    "fake shop": "FAKE_SHOP", "fake_shop": "FAKE_SHOP",
-    "фейк работа": "FAKE_JOB", "ложная вакансия": "FAKE_JOB", "жалған жұмыс": "FAKE_JOB",
-    "fake job": "FAKE_JOB", "job_scam": "JOB_SCAM",
-    "романтик скам": "ROMANCE_SCAM", "love scam": "ROMANCE_SCAM", "romance_scam": "ROMANCE_SCAM",
-    "кража данных": "IDENTITY_THEFT", "identity theft": "IDENTITY_THEFT",
-    "фальшивая благотворительность": "FAKE_CHARITY", "fake charity": "FAKE_CHARITY",
-    "вымогательство": "EXTORTION", "рэкет": "EXTORTION", "бопсалау": "EXTORTION", "extortion": "EXTORTION",
-    "blackmail": "BLACKMAIL", "шантаж": "BLACKMAIL",
-    "торговля людьми": "HUMAN_TRAFFICKING", "адам саудасы": "HUMAN_TRAFFICKING",
-    "human trafficking": "HUMAN_TRAFFICKING",
-    "экстремизм": "EXTREMISM", "экстремистік": "EXTREMISM", "extremism": "EXTREMISM",
-    "незаконные услуги": "ILLEGAL_SERVICES", "нелегальные услуги": "ILLEGAL_SERVICES",
-    "заңсыз қызмет": "ILLEGAL_SERVICES", "illegal services": "ILLEGAL_SERVICES",
-    "illegal_services": "ILLEGAL_SERVICES", "теневые услуги": "ILLEGAL_SERVICES",
-    "фиктивная регистрация": "ILLEGAL_SERVICES",
-
-    # --- Казино / азартные игры ---
-    "азартные игры": "GAMBLING", "казино": "GAMBLING", "онлайн казино": "GAMBLING", "слоты": "GAMBLING",
-    "рулетка": "GAMBLING", "покер": "GAMBLING", "құмар ойын": "GAMBLING", "gambling": "GAMBLING",
-    "casino": "GAMBLING", "бездепозитный бонус": "GAMBLING", "бонус за регистрацию": "GAMBLING",
-    "фейковое казино": "CASINO_SCAM", "casino_scam": "CASINO_SCAM",
-    "нелегальное казино": "ILLEGAL_GAMBLING", "illegal_gambling": "ILLEGAL_GAMBLING",
-    "договорные матчи": "BETTING_FRAUD", "betting_fraud": "BETTING_FRAUD",
-
-    # --- Вейпы, эскорт, взрослый контент ---
-    "вейп": "VAPE_SCAM", "vape": "VAPE_SCAM", "жижа": "VAPE_SCAM", "электронные сигареты": "VAPE_SCAM",
-    "подак": "VAPE_SCAM", "pod system": "VAPE_SCAM", "вэйп": "VAPE_SCAM", "vape_scam": "VAPE_SCAM",
-    "эскорт": "ESCORT", "escort": "ESCORT", "девушки по вызову": "ESCORT", "call girl": "ESCORT",
-    "интим услуги": "ESCORT", "интимные услуги": "ESCORT", "индивидуалка": "ESCORT",
-    "проституция": "PROSTITUTION", "проститутки": "PROSTITUTION", "prostitution": "PROSTITUTION",
-    "сутенер": "PIMPING", "сутенерство": "PIMPING", "pimping": "PIMPING",
-    "массажный салон": "ILLEGAL_SPA", "эромассаж": "ILLEGAL_SPA", "illegal_spa": "ILLEGAL_SPA",
-    "сайт знакомств": "ADULT_DATING", "взрослые знакомства": "ADULT_DATING", "adult_dating": "ADULT_DATING",
 
     # --- Общие ---
     "чисто": "CLEAN", "таза": "CLEAN", "clean": "CLEAN",
